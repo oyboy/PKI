@@ -6,6 +6,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from cryptography.x509.oid import NameOID
+from cryptography.exceptions import InvalidSignature
+import sys
 
 OID_MAP = {
     'CN': NameOID.COMMON_NAME,
@@ -130,3 +132,70 @@ def ensure_pki_dirs(out_dir: str, logger):
         logger.warning("Cannot set 0o700 on private/ (Windows implementation may vary)")
         
     return private_dir, certs_dir
+
+def load_private_key(path: str, passphrase: bytes | None) -> serialization.load_pem_private_key:
+    with open(path, "rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=passphrase)
+
+def load_certificate(path: str) -> x509.Certificate:
+    with open(path, "rb") as f:
+        return x509.load_pem_x509_certificate(f.read())
+
+def save_unencrypted_key(private_key, path: str):
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    with open(path, "wb") as f:
+        f.write(pem)
+
+def verify_chain(args, logger):
+    logger.info("=== Verifying certificate chain ===")
+    
+    leaf_cert = load_certificate(args.leaf_cert)
+    logger.info(f"Loaded leaf certificate: {leaf_cert.subject.rfc4514_string()}")
+
+    chain = []
+    if args.untrusted:
+        for untrusted_path in args.untrusted:
+            cert = load_certificate(untrusted_path)
+            chain.append(cert)
+            logger.info(f"Loaded untrusted certificate: {cert.subject.rfc4514_string()}")
+    
+    ca_cert = load_certificate(args.ca_file)
+    logger.info(f"Loaded trusted root: {ca_cert.subject.rfc4514_string()}")
+    
+    all_certs = [leaf_cert] + chain
+    issuers = chain + [ca_cert]
+
+    for i, cert in enumerate(all_certs):
+        issuer = issuers[i]
+        
+        logger.info(f"Verifying signature of '{cert.subject.rfc4514_string()}' against '{issuer.subject.rfc4514_string()}'")
+        
+        try:
+            issuer.public_key().verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                cert.signature_algorithm_parameters,
+                cert.signature_hash_algorithm
+            )
+            logger.info("  [OK] Signature is valid.")
+        except InvalidSignature:
+            logger.error("  [FAIL] Signature is INVALID!")
+            sys.exit(1)
+
+        now = datetime.utcnow()
+        if not (cert.not_valid_before <= now <= cert.not_valid_after):
+            logger.error(f"  [FAIL] Certificate for '{cert.subject.rfc4514_string()}' has expired or is not yet valid.")
+            sys.exit(1)
+        logger.info("  [OK] Validity period is fine.")
+        
+        bc = issuer.extensions.get_extension_for_class(x509.BasicConstraints).value
+        if not bc.ca:
+            logger.error(f"  [FAIL] Issuer '{issuer.subject.rfc4514_string()}' is not a CA.")
+            sys.exit(1)
+        logger.info("  [OK] Issuer is a CA.")
+
+    logger.info("\nSUCCESS: Certificate chain appears to be valid.")

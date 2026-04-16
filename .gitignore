@@ -1,2 +1,5 @@
 pki
 secrets
+.pytest_cache
+micropki/__pycache__
+tests/__pycache__
