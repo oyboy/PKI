@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import re
 
+import datetime
 from .database import Database
 
 app = FastAPI(title="MicroPKI Repository")
@@ -56,12 +57,24 @@ async def get_ca_certificate(level: str):
     return Response(content=pem, media_type="application/x-pem-file")
 
 @app.get("/crl")
-async def get_crl():
+async def get_crl(ca: str = "intermediate"):
+    cert_dir = app.state.cert_dir
+    crl_path = os.path.join(os.path.dirname(cert_dir), "crl", f"{ca}.crl.pem")
+    
+    if not os.path.exists(crl_path):
+        raise HTTPException(status_code=404, detail=f"CRL for {ca} not found.")
+        
+    with open(crl_path, "rb") as f:
+        crl_data = f.read()
+        
+    stat = os.stat(crl_path)
     return Response(
-        content="CRL generation is not implemented", 
-        status_code=501, 
-        media_type="text/plain",
-        headers={"Content-Type": "application/pkix-crl"}
+        content=crl_data,
+        media_type="application/pkix-crl",
+        headers={
+            "Last-Modified": datetime.datetime.fromtimestamp(stat.st_mtime, datetime.timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT'),
+            "Cache-Control": "max-age=3600"
+        }
     )
 
 def run_server(host: str, port: int, db_path: str, cert_dir: str):

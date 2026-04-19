@@ -32,6 +32,14 @@ class Database:
                     created_at TEXT NOT NULL
                 );
                 """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS crl_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ca_subject TEXT UNIQUE NOT NULL,
+                    crl_number INTEGER NOT NULL,
+                    last_generated TEXT NOT NULL
+                );
+                """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON certificates (status);")
                 conn.commit()
             self.logger.info("Database schema initialized successfully.")
@@ -98,3 +106,49 @@ class Database:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return cursor.fetchall()
+
+    def revoke_certificate(self, serial_hex, reason):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status, issuer FROM certificates WHERE serial_hex = ?", (serial_hex.upper(),))
+            row = cursor.fetchone()
+            if not row:
+                return "not_found"
+            if row[0] == 'revoked':
+                return "already_revoked"
+            
+            cursor.execute("""
+                UPDATE certificates 
+                SET status = 'revoked', revocation_date = ?, revocation_reason = ? 
+                WHERE serial_hex = ?
+            """, (now, reason, serial_hex.upper()))
+            conn.commit()
+            return row[1]
+
+    def get_revoked_for_issuer(self, issuer_dn):
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT serial_hex, revocation_date, revocation_reason 
+                FROM certificates 
+                WHERE status = 'revoked' AND issuer = ?
+            """, (issuer_dn,))
+            return cursor.fetchall()
+
+    def get_next_crl_number(self, ca_subject):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT crl_number FROM crl_metadata WHERE ca_subject = ?", (ca_subject,))
+            row = cursor.fetchone()
+            if row:
+                new_num = row[0] + 1
+                cursor.execute("UPDATE crl_metadata SET crl_number = ?, last_generated = ? WHERE ca_subject = ?",
+                               (new_num, datetime.now(timezone.utc).isoformat(), ca_subject))
+            else:
+                new_num = 1
+                cursor.execute("INSERT INTO crl_metadata (ca_subject, crl_number, last_generated) VALUES (?, ?, ?)",
+                               (ca_subject, new_num, datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+            return new_num

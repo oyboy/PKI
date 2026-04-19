@@ -152,6 +152,7 @@ def issue_intermediate(args, logger):
     logger.info("SUCCESS: Intermediate CA created and recorded in the database.")
     logger.info(f"  Key: {key_path}")
     logger.info(f"  Cert: {cert_path}")
+    update_policy_for_intermediate(args, intermediate_cert)
 
 def issue_cert(args, logger):
     logger.info(f"=== Starting certificate issuance with template '{args.template}' ===")
@@ -241,3 +242,19 @@ def enforce_leaf_constraints(cert):
     bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
     if bc.ca:
         raise ValueError("Leaf certificate must not have CA=true")
+
+def update_policy_for_intermediate(args, cert):
+    policy_path = os.path.join(args.out_dir, "policy.txt")
+    
+    new_entry = (
+        f"\n--- Intermediate CA Added ---\n"
+        f"Subject: {args.subject}\n"
+        f"Serial: {hex(cert.serial_number)}\n"
+        f"Valid: {cert.not_valid_before_utc.isoformat()} to {cert.not_valid_after_utc.isoformat()}\n"
+        f"Key: {args.key_type.upper()} ({args.key_size})\n"
+        f"Path Length: {args.pathlen}\n"
+        f"Issuer: {cert.issuer.rfc4514_string()}\n"
+    )
+    
+    with open(policy_path, "a", encoding="utf-8") as f:
+        f.write(new_entry)

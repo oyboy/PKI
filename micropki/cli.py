@@ -8,6 +8,9 @@ from .ca import init_ca, issue_intermediate, issue_cert, verify_chain
 from .database import Database
 from .repository import run_server
 
+from .crypto_utils import load_certificate, load_private_key
+from .revocation import REASON_CODES
+from .crl import generate_crl
 
 def validate_key_params(args):
     if not hasattr(args, "key_type"):
@@ -112,6 +115,56 @@ def handle_db_init(args, logger):
 def handle_repo_serve(args, logger):
     run_server(args.host, args.port, args.db_path, args.cert_dir)
 
+def handle_revoke(args, logger):
+    logger.info(f"Revoking certificate {args.serial}...")
+    if args.reason not in REASON_CODES:
+        logger.error(f"Invalid reason: {args.reason}")
+        sys.exit(1)
+        
+    db = Database(args.db_path, logger)
+    result = db.revoke_certificate(args.serial, args.reason)
+    
+    if result == "not_found":
+        logger.error("Certificate not found.")
+        sys.exit(1)
+    elif result == "already_revoked":
+        logger.warning("Certificate is already revoked.")
+    else:
+        logger.info(f"SUCCESS: Certificate {args.serial} revoked.")
+
+def handle_gen_crl(args, logger):
+    db = Database(args.db_path, logger)
+    
+    if args.ca == 'root':
+        cert_path = os.path.join(args.out_dir, "certs/ca.cert.pem")
+        key_path = os.path.join(args.out_dir, "private/ca.key.pem")
+        pass_path = args.root_pass_file
+    else:
+        cert_path = os.path.join(args.out_dir, "certs/intermediate.cert.pem")
+        key_path = os.path.join(args.out_dir, "private/intermediate.key.pem")
+        pass_path = args.ca_pass_file
+        
+    ca_cert = load_certificate(cert_path)
+    with open(pass_path, 'rb') as f:
+        passphrase = f.read().strip()
+    ca_key = load_private_key(key_path, passphrase)
+    
+    revoked = db.get_revoked_for_issuer(ca_cert.subject.rfc4514_string())
+    
+    crl_num = db.get_next_crl_number(ca_cert.subject.rfc4514_string())
+    
+    logger.info(f"Generating CRL #{crl_num} for {args.ca} with {len(revoked)} entries...")
+    crl_pem = generate_crl(ca_cert, ca_key, revoked, crl_num, args.next_update)
+    
+    crl_dir = os.path.join(args.out_dir, "crl")
+    os.makedirs(crl_dir, exist_ok=True)
+    out_path = args.out_file or os.path.join(crl_dir, f"{args.ca}.crl.pem")
+    
+    with open(out_path, 'wb') as f:
+        f.write(crl_pem)
+    
+    logger.info(f"SUCCESS: CRL saved to {out_path}")
+
 
 def build_parser():
     parent = argparse.ArgumentParser(add_help=False)
@@ -196,6 +249,23 @@ def build_parser():
     serve_p.add_argument("--db-path", **db_path_arg)
     serve_p.add_argument("--cert-dir", **cert_dir_arg)
     serve_p.set_defaults(func=handle_repo_serve)
+
+    revoke_p = ca_subparsers.add_parser("revoke", help="Revoke a certificate")
+    revoke_p.add_argument("serial", help="Serial number in hex")
+    revoke_p.add_argument("--reason", default="unspecified", choices=list(REASON_CODES.keys()))
+    revoke_p.add_argument("--db-path", **db_path_arg)
+    revoke_p.set_defaults(func=handle_revoke)
+
+    gen_crl_p = ca_subparsers.add_parser("gen-crl", help="Generate CRL")
+    gen_crl_p.add_argument("--ca", choices=["root", "intermediate"], required=True)
+    gen_crl_p.add_argument("--next-update", type=int, default=7)
+    gen_crl_p.add_argument("--out-dir", default="./pki")
+    gen_crl_p.add_argument("--out-file", help="Custom output path")
+    gen_crl_p.add_argument("--db-path", **db_path_arg)
+
+    gen_crl_p.add_argument("--root-pass-file", default="./secrets/root.pass")
+    gen_crl_p.add_argument("--ca-pass-file", default="./secrets/intermediate.pass")
+    gen_crl_p.set_defaults(func=handle_gen_crl)
 
     return parser
 

@@ -243,6 +243,79 @@ ok "Все сертификаты успешно получены через API
 kill $SERVER_PID
 SERVER_PID=""
 
+info "============================== SPRINT 4 =============================="
+
+info "--- [TEST-21] Жизненный цикл отзыва ---"
+python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "/CN=to-be-revoked.com" \
+    --san dns:to-be-revoked.com \
+    --out-dir .
+
+SERIAL_REVOKE=$(python3 -m micropki ca list-certs --format csv | grep "to-be-revoked.com" | cut -d, -f1)
+[ -n "$SERIAL_REVOKE" ] || fail "Не удалось найти серийный номер для отзыва."
+
+python3 -m micropki ca list-certs --format csv | grep "$SERIAL_REVOKE" | grep -q "valid" || fail "Начальный статус не valid."
+
+python3 -m micropki ca revoke "$SERIAL_REVOKE" --reason keyCompromise --force
+ok "Сертификат $SERIAL_REVOKE отозван."
+
+python3 -m micropki ca list-certs --format csv | grep "$SERIAL_REVOKE" | grep -q "revoked" || fail "Статус в БД не изменился на revoked."
+
+python3 -m micropki ca gen-crl --ca intermediate --next-update 7
+[ -f ./pki/crl/intermediate.crl.pem ] || fail "Файл CRL не создан."
+
+CRL_TEXT=$(openssl crl -inform PEM -in ./pki/crl/intermediate.crl.pem -text -noout)
+echo "$CRL_TEXT" | grep -q "$SERIAL_REVOKE" || fail "Серийный номер отсутствует в CRL."
+echo "$CRL_TEXT" | grep -q "Key Compromise" || fail "Причина отзыва в CRL указана неверно."
+ok "CRL содержит информацию об отозванном сертификате."
+
+info "--- [TEST-22] Проверка подписи CRL ---"
+openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -CAfile ./pki/certs/intermediate.cert.pem -noout 2>&1 | grep -q "verify OK" || fail "Подпись CRL невалидна."
+ok "Подпись CRL подтверждена."
+
+info "--- [TEST-23] Проверка увеличения номера CRL ---"
+NUM1=$(openssl crl -in ./pki/pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
+python3 -m micropki ca gen-crl --ca intermediate --next-update 7
+NUM2=$(openssl crl -in ./pki/pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
+
+if [ "$NUM2" -le "$NUM1" ]; then
+    fail "Номер CRL не увеличился (было $NUM1, стало $NUM2)."
+fi
+ok "Номер CRL успешно инкрементирован ($NUM1 -> $NUM2)."
+
+info "--- [TEST-24/25] Негативные тесты отзыва ---"
+set +e
+python3 -m micropki ca revoke "DEADC0DE" --reason keyCompromise --force 2>/dev/null
+RET=$?
+set -e
+[ $RET -ne 0 ] || fail "Отзыв несуществующего сертификата должен возвращать ошибку."
+ok "Тест на несуществующий серийник пройден."
+
+python3 -m micropki ca revoke "$SERIAL_REVOKE" --reason keyCompromise --force | grep -q "already revoked" || fail "Должно быть предупреждение об уже отозванном статусе."
+ok "Тест на повторный отзыв пройден."
+
+info "--- [TEST-26] Тест распространения CRL через API ---"
+python3 -m micropki repo serve &
+SERVER_PID=$!
+sleep 2
+
+curl -s http://localhost:8080/crl?ca=intermediate > downloaded.crl.pem
+diff downloaded.crl.pem ./pki/crl/intermediate.crl.pem || fail "CRL полученный по HTTP отличается от локального."
+curl -s -I http://localhost:8080/crl?ca=intermediate | grep -q "application/pkix-crl" || fail "Неверный Content-Type для CRL."
+
+kill $SERVER_PID
+SERVER_PID=""
+rm downloaded.crl.pem to-be-revoked.com.cert.pem to-be-revoked.com.key.pem
+ok "API успешно отдает файлы CRL."
+
+echo ""
+echo -e "${GREEN}======================================================"
+echo -e "    ВСЕ ТЕСТЫ (SPRINT 1-4) УСПЕШНО ПРОЙДЕНЫ!    "
+echo -e "======================================================${NC}"
 
 echo ""
 echo -e "${GREEN}========================================="
