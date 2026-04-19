@@ -160,11 +160,16 @@ def issue_cert(args, logger):
 
     template = TEMPLATES[args.template]
     try:
-        san_ext = parse_san(args.san or [])
-        for san in san_ext:
-            san_type_str = san.__class__.__name__.replace("Name", "").replace("Address", "").lower()
-            if san_type_str not in template["valid_san_types"]:
-                raise ValueError(f"SAN type '{san_type_str}' is not allowed for template '{args.template}'")
+        san_list = args.san or []
+        for san_str in san_list:
+            if ":" not in san_str:
+                logger.error(f"Invalid SAN format: {san_str}")
+                sys.exit(1)
+            san_type = san_str.split(":", 1)[0].lower().strip()
+            if san_type not in template["valid_san_types"]:
+                logger.error(f"SAN type '{san_type}' is not allowed for template '{args.template}'")
+                sys.exit(1)
+        san_ext = parse_san(san_list)
     except ValueError as e:
         logger.error(f"Invalid SAN: {e}")
         sys.exit(1)

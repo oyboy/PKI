@@ -67,6 +67,16 @@ python3 -m micropki ca issue-intermediate \
 ok "Intermediate CA успешно создан."
 
 info "--- [СПРИНТ 2] Проверка Intermediate CA ---"
+
+CERT_TEXT_INT=$(openssl x509 -in ./pki/certs/intermediate.cert.pem -text -noout)
+
+echo "$CERT_TEXT_INT" | grep -q "CA:TRUE" || fail "Intermediate не является CA."
+echo "$CERT_TEXT_INT" | grep -q "pathlen:0" || fail "Не установлен pathlen=0."
+echo "$CERT_TEXT_INT" | grep -q "Certificate Sign" || fail "Отсутствует keyCertSign."
+echo "$CERT_TEXT_INT" | grep -q "CRL Sign" || fail "Отсутствует cRLSign."
+
+ok "Intermediate CA прошел базовую проверку."
+
 openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/intermediate.cert.pem | grep -q "OK" || fail "Проверка Intermediate CA через OpenSSL провалена."
 python3 -m micropki ca verify-chain --ca-file ./pki/certs/ca.cert.pem --leaf-cert ./pki/certs/intermediate.cert.pem || fail "Проверка Intermediate CA через micropki провалена."
 ok "Проверка цепочки Root -> Intermediate прошла успешно."
@@ -86,6 +96,60 @@ python3 -m micropki ca issue-cert \
 
 [ -f ./example.com.cert.pem ] && [ -f ./example.com.key.pem ] || fail "Конечный сертификат не создан."
 ok "Серверный сертификат для example.com успешно создан."
+
+info "--- [СПРИНТ 2] Выпуск клиентского сертификата ---"
+python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template client \
+    --subject "/CN=Alice Smith/EMAIL=alice@example.com" \
+    --san email:alice@example.com \
+    --out-dir ./pki/certs \
+    --log-file ./logs/test.log
+
+[ -f ./pki/certs/alice_smith.cert.pem ] || fail "Клиентский сертификат не создан."
+ok "Клиентский сертификат успешно создан."
+
+info "--- [СПРИНТ 2] Проверка клиентского сертификата ---"
+openssl verify \
+    -CAfile ./pki/certs/ca.cert.pem \
+    -untrusted ./pki/certs/intermediate.cert.pem \
+    ./pki/certs/alice_smith.cert.pem | grep -q "OK" || fail "Проверка клиентского сертификата провалена."
+
+CERT_TEXT_CLIENT=$(openssl x509 -in ./pki/certs/alice_smith.cert.pem -text -noout)
+
+echo "$CERT_TEXT_CLIENT" | grep -q "CA:FALSE" || fail "Клиентский сертификат ошибочно является CA."
+echo "$CERT_TEXT_CLIENT" | grep -q "TLS Web Client Authentication" || fail "Отсутствует EKU Client Authentication."
+echo "$CERT_TEXT_CLIENT" | grep -q "email:alice@example.com" || fail "SAN email отсутствует."
+
+ok "Клиентский сертификат прошел проверку."
+
+info "--- [СПРИНТ 2] Выпуск сертификата подписи кода ---"
+python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template code_signing \
+    --subject "/CN=MicroPKI Code Signer" \
+    --out-dir ./pki/certs \
+    --log-file ./logs/test.log
+
+[ -f ./pki/certs/micropki_code_signer.cert.pem ] || fail "Сертификат подписи кода не создан."
+ok "Сертификат подписи кода успешно создан."
+
+info "--- [СПРИНТ 2] Проверка сертификата подписи кода ---"
+openssl verify \
+    -CAfile ./pki/certs/ca.cert.pem \
+    -untrusted ./pki/certs/intermediate.cert.pem \
+    ./pki/certs/micropki_code_signer.cert.pem | grep -q "OK" || fail "Проверка сертификата подписи кода провалена."
+
+CERT_TEXT_CODE=$(openssl x509 -in ./pki/certs/micropki_code_signer.cert.pem -text -noout)
+
+echo "$CERT_TEXT_CODE" | grep -q "Code Signing" || fail "Отсутствует EKU Code Signing."
+echo "$CERT_TEXT_CODE" | grep -q "CA:FALSE" || fail "Code signing сертификат ошибочно является CA."
+
+ok "Сертификат подписи кода прошел проверку."
 
 info "--- [СПРИНТ 2] Проверка полной цепочки сертификатов ---"
 cat ./pki/certs/intermediate.cert.pem ./pki/certs/ca.cert.pem > chain.pem
