@@ -56,7 +56,7 @@ def test_issue_cert_invalid_san_for_template(tmp_path):
     
     assert e.value.code == 1
     mock_logger.error.assert_called_with(
-        "Invalid SAN: SAN type 'rfc822' is not allowed for template 'server'"
+        "SAN type 'email' is not allowed for template 'server'"
     )
 
 def test_no_san_server_cert(tmp_path):

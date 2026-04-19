@@ -7,7 +7,10 @@ class Database:
     def __init__(self, db_path, logger):
         self.db_path = db_path
         self.logger = logger
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        dirpath = os.path.dirname(db_path)
+        if db_path != ":memory:" and dirpath:
+            os.makedirs(dirpath, exist_ok=True)
 
     def _get_connection(self):
         return sqlite3.connect(self.db_path)

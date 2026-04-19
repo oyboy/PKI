@@ -17,8 +17,8 @@ from .database import Database
 def create_policy_file(out_dir, args, cert):
     policy_path = os.path.join(out_dir, "policy.txt")
     
-    not_before = cert.not_valid_before.isoformat()
-    not_after = cert.not_valid_after.isoformat()
+    not_before = cert.not_valid_before_utc.isoformat()
+    not_after = cert.not_valid_after_utc.isoformat()
     serial_hex = hex(cert.serial_number)
     
     content = (
