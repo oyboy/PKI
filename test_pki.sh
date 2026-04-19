@@ -30,7 +30,13 @@ cleanup() {
 
 trap cleanup EXIT
 
-info "--- [СПРИНТ 1] Создание Root CA ---"
+info "============================== SPRINT 1 =============================="
+info "--- Инициализация БД ---"
+python -m micropki db init
+[ -f ./pki/micropki.db ] || fail "Файл базы данных не создан."
+ok "База данных успешно инициализирована."
+
+info "--- Создание Root CA ---"
 mkdir -p ./secrets
 mkdir -p ./logs
 echo "root_password_123" > ./secrets/root.pass
@@ -45,7 +51,7 @@ python3 -m micropki ca init \
 [ -f ./pki/certs/ca.cert.pem ] && [ -f ./pki/private/ca.key.pem ] || fail "Файлы Root CA не созданы."
 ok "Root CA успешно создан."
 
-info "--- [СПРИНТ 1] Проверка Root CA ---"
+info "--- Проверка Root CA ---"
 openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/ca.cert.pem | grep -q "OK" || fail "Самопроверка Root CA провалена."
 CERT_TEXT_ROOT=$(openssl x509 -in ./pki/certs/ca.cert.pem -text -noout)
 if ! (echo "$CERT_TEXT_ROOT" | grep "X509v3 Basic Constraints:" | grep -q "critical" && echo "$CERT_TEXT_ROOT" | grep -q "CA:TRUE"); then
@@ -53,7 +59,8 @@ if ! (echo "$CERT_TEXT_ROOT" | grep "X509v3 Basic Constraints:" | grep -q "criti
 fi
 ok "Root CA прошел базовую проверку."
 
-info "--- [СПРИНТ 2] Создание Intermediate CA ---"
+info "============================== SPRINT 2 =============================="
+info "--- Создание Intermediate CA ---"
 python3 -m micropki ca issue-intermediate \
     --root-cert ./pki/certs/ca.cert.pem \
     --root-key ./pki/private/ca.key.pem \
@@ -66,7 +73,7 @@ python3 -m micropki ca issue-intermediate \
 [ -f ./pki/certs/intermediate.cert.pem ] || fail "Сертификат Intermediate CA не создан."
 ok "Intermediate CA успешно создан."
 
-info "--- [СПРИНТ 2] Проверка Intermediate CA ---"
+info "--- Проверка Intermediate CA ---"
 
 CERT_TEXT_INT=$(openssl x509 -in ./pki/certs/intermediate.cert.pem -text -noout)
 
@@ -81,7 +88,7 @@ openssl verify -CAfile ./pki/certs/ca.cert.pem ./pki/certs/intermediate.cert.pem
 python3 -m micropki ca verify-chain --ca-file ./pki/certs/ca.cert.pem --leaf-cert ./pki/certs/intermediate.cert.pem || fail "Проверка Intermediate CA через micropki провалена."
 ok "Проверка цепочки Root -> Intermediate прошла успешно."
 
-info "--- [СПРИНТ 2] Выпуск серверного сертификата ---"
+info "--- Выпуск серверного сертификата ---"
 python3 -m micropki ca issue-cert \
     --ca-cert ./pki/certs/intermediate.cert.pem \
     --ca-key ./pki/private/intermediate.key.pem \
@@ -97,7 +104,7 @@ python3 -m micropki ca issue-cert \
 [ -f ./example.com.cert.pem ] && [ -f ./example.com.key.pem ] || fail "Конечный сертификат не создан."
 ok "Серверный сертификат для example.com успешно создан."
 
-info "--- [СПРИНТ 2] Выпуск клиентского сертификата ---"
+info "--- Выпуск клиентского сертификата ---"
 python3 -m micropki ca issue-cert \
     --ca-cert ./pki/certs/intermediate.cert.pem \
     --ca-key ./pki/private/intermediate.key.pem \
@@ -111,7 +118,7 @@ python3 -m micropki ca issue-cert \
 [ -f ./pki/certs/alice_smith.cert.pem ] || fail "Клиентский сертификат не создан."
 ok "Клиентский сертификат успешно создан."
 
-info "--- [СПРИНТ 2] Проверка клиентского сертификата ---"
+info "--- Проверка клиентского сертификата ---"
 openssl verify \
     -CAfile ./pki/certs/ca.cert.pem \
     -untrusted ./pki/certs/intermediate.cert.pem \
@@ -125,7 +132,7 @@ echo "$CERT_TEXT_CLIENT" | grep -q "email:alice@example.com" || fail "SAN email 
 
 ok "Клиентский сертификат прошел проверку."
 
-info "--- [СПРИНТ 2] Выпуск сертификата подписи кода ---"
+info "--- Выпуск сертификата подписи кода ---"
 python3 -m micropki ca issue-cert \
     --ca-cert ./pki/certs/intermediate.cert.pem \
     --ca-key ./pki/private/intermediate.key.pem \
@@ -138,7 +145,7 @@ python3 -m micropki ca issue-cert \
 [ -f ./pki/certs/micropki_code_signer.cert.pem ] || fail "Сертификат подписи кода не создан."
 ok "Сертификат подписи кода успешно создан."
 
-info "--- [СПРИНТ 2] Проверка сертификата подписи кода ---"
+info "--- Проверка сертификата подписи кода ---"
 openssl verify \
     -CAfile ./pki/certs/ca.cert.pem \
     -untrusted ./pki/certs/intermediate.cert.pem \
@@ -151,7 +158,7 @@ echo "$CERT_TEXT_CODE" | grep -q "CA:FALSE" || fail "Code signing сертифи
 
 ok "Сертификат подписи кода прошел проверку."
 
-info "--- [СПРИНТ 2] Проверка полной цепочки сертификатов ---"
+info "--- Проверка полной цепочки сертификатов ---"
 cat ./pki/certs/intermediate.cert.pem ./pki/certs/ca.cert.pem > chain.pem
 
 openssl verify -CAfile ./pki/certs/ca.cert.pem -untrusted ./pki/certs/intermediate.cert.pem ./example.com.cert.pem | grep -q "OK" || fail "Полная проверка цепочки через OpenSSL провалена."
@@ -166,7 +173,7 @@ echo "$CERT_TEXT_LEAF" | grep -q "IP Address:127.0.0.1" || fail "В SAN отсу
 echo "$CERT_TEXT_LEAF" | grep -q "TLS Web Server Authentication" || fail "Отсутствует EKU 'Server Authentication'."
 ok "Проверка полной цепочки и расширений конечного сертификата прошла успешно."
 
-info "--- [СПРИНТ 2] Запуск сквозного TLS-теста (s_server / s_client) ---"
+info "--- Запуск сквозного TLS-теста (s_server / s_client) ---"
 openssl s_server \
     -accept 8443 \
     -cert ./example.com.cert.pem \
@@ -189,6 +196,53 @@ fi
 
 kill $SERVER_PID
 SERVER_PID=""
+
+info "============================== SPRINT 3 =============================="
+info "--- Выпуск 5 конечных сертификатов ---"
+CERT_SUBJECTS=("server1.example.com" "server2.example.com" "client.user" "another.client" "codesigner.corp")
+CERT_TEMPLATES=("server" "server" "client" "client" "code_signing")
+
+for i in {0..4}; do
+    subj="/CN=${CERT_SUBJECTS[$i]}"
+    template=${CERT_TEMPLATES[$i]}
+    info "Выпуск сертификата для ${subj} (шаблон: ${template})"
+    python -m micropki ca issue-cert --ca-cert ./pki/certs/intermediate.cert.pem --ca-key ./pki/private/intermediate.key.pem --ca-pass-file ./secrets/intermediate.pass --template ${template} --subject "${subj}" --san "dns:${CERT_SUBJECTS[$i]}" --out-dir ./pki/certs
+done
+ok "5 сертификатов выпущено."
+
+info "--- Проверка сертификатов через CLI ---"
+CERT_COUNT=$(python -m micropki ca list-certs --format csv | wc -l)
+[ "$CERT_COUNT" -eq 10 ] || fail "В БД неверное количество сертификатов. Ожидалось 7, найдено $((CERT_COUNT - 1))."
+SERIAL_TO_CHECK=$(python -m micropki ca list-certs --format csv | grep server1 | cut -d, -f1)
+python -m micropki ca show-cert ${SERIAL_TO_CHECK} | grep -q "BEGIN CERTIFICATE" || fail "ca show-cert не вернул PEM сертификат."
+ok "Проверки list-certs и show-cert прошли успешно."
+
+info "--- Запуск и проверка API репозитория ---"
+python -m micropki repo serve &
+SERVER_PID=$!
+sleep 2
+
+info "Проверка /ca/root и /ca/intermediate..."
+curl -s http://localhost:8080/ca/root | diff - ./pki/certs/ca.cert.pem || fail "API /ca/root вернул неверный сертификат."
+curl -s http://localhost:8080/ca/intermediate | diff - ./pki/certs/intermediate.cert.pem || fail "API /ca/intermediate вернул неверный сертификат."
+ok "/ca эндпоинты работают."
+
+info "Проверка /certificate/<serial> для всех выпущенных сертификатов..."
+SERIALS=$(python -m micropki ca list-certs --format csv | tail -n +2 | cut -d, -f1)
+for SERIAL in $SERIALS; do
+    CN=$(python -m micropki ca list-certs --format csv | grep $SERIAL | cut -d, -f2 | cut -d= -f2)
+    FILENAME=$(echo "$CN" | tr ' ' '_' | tr '[:upper:]' '[:lower:]').cert.pem
+    
+    if [ ! -f "./pki/certs/$FILENAME" ]; then continue; fi
+
+    info "  Проверка серийника ${SERIAL} (файл ${FILENAME})"
+    curl -s http://localhost:8080/certificate/${SERIAL} | diff - ./pki/certs/${FILENAME} || fail "API /certificate/${SERIAL} вернул неверные данные."
+done
+ok "Все сертификаты успешно получены через API."
+
+kill $SERVER_PID
+SERVER_PID=""
+
 
 echo ""
 echo -e "${GREEN}========================================="

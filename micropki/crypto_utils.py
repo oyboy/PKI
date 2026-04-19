@@ -57,7 +57,7 @@ def generate_key(key_type: str, key_size: int):
 
 def create_self_signed_cert(private_key, subject_str: str, validity_days: int) -> x509.Certificate:
     subject = parse_dn(subject_str)
-    serial = secrets.randbits(20) 
+    serial = generate_unique_serial()
     not_before = datetime.now(timezone.utc)
     not_after = not_before + timedelta(days=validity_days)
 
@@ -199,3 +199,11 @@ def verify_chain(args, logger):
         logger.info("  [OK] Issuer is a CA.")
 
     logger.info("\nSUCCESS: Certificate chain appears to be valid.")
+
+
+def generate_unique_serial() -> int:
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    random_part = secrets.randbits(64)
+
+    serial = (timestamp << 64) | random_part
+    return serial

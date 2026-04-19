@@ -3,3 +3,6 @@ secrets
 .pytest_cache
 micropki/__pycache__
 tests/__pycache__
+*.db
+*.db-journal
+venv

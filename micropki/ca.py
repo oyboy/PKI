@@ -6,12 +6,13 @@ import secrets
 from .crypto_utils import (
     generate_key, create_self_signed_cert, save_encrypted_key, save_cert,
     ensure_pki_dirs, load_private_key, load_certificate, save_unencrypted_key,
-    parse_dn, verify_chain
+    parse_dn, verify_chain, generate_unique_serial
 )
 from .templates import TEMPLATES, parse_san
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
+from .database import Database
 
 def create_policy_file(out_dir, args, cert):
     policy_path = os.path.join(out_dir, "policy.txt")
@@ -109,7 +110,7 @@ def issue_intermediate(args, logger):
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(issuer)
     builder = builder.public_key(intermediate_key.public_key())
-    builder = builder.serial_number(secrets.randbits(159))
+    builder = builder.serial_number(generate_unique_serial())
     builder = builder.not_valid_before(datetime.now(timezone.utc))
     builder = builder.not_valid_after(datetime.now(timezone.utc) + timedelta(days=args.validity_days))
 
@@ -141,7 +142,14 @@ def issue_intermediate(args, logger):
     os.chmod(key_path, 0o600)
     save_cert(intermediate_cert, cert_path)
 
-    logger.info("SUCCESS: Intermediate CA created.")
+    try:
+        db = Database(args.db_path, logger)
+        db.insert_cert(intermediate_cert)
+    except Exception as e:
+        logger.error(f"FATAL: Could not write cert to database. Aborting. Error: {e}")
+        sys.exit(1)
+
+    logger.info("SUCCESS: Intermediate CA created and recorded in the database.")
     logger.info(f"  Key: {key_path}")
     logger.info(f"  Cert: {cert_path}")
 
@@ -186,7 +194,7 @@ def issue_cert(args, logger):
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(ca_cert.subject)
     builder = builder.public_key(entity_key.public_key())
-    builder = builder.serial_number(secrets.randbits(159))
+    builder = builder.serial_number(generate_unique_serial())
     builder = builder.not_valid_before(datetime.now(timezone.utc))
     builder = builder.not_valid_after(datetime.now(timezone.utc) + timedelta(days=args.validity_days))
 
@@ -213,6 +221,16 @@ def issue_cert(args, logger):
     enforce_leaf_constraints(entity_cert)
 
     save_cert(entity_cert, cert_path)
+
+    try:
+        db = Database(args.db_path, logger)
+        db.insert_cert(entity_cert)
+    except Exception as e:
+        logger.error(f"FATAL: Could not write cert to database. Aborting. Error: {e}")
+        sys.exit(1)
+
+    logger.info(f"SUCCESS: Certificate for '{cn}' issued and recorded in the database.")
+    
     logger.warning(f"Saving unencrypted private key to {key_path}")
     save_unencrypted_key(entity_key, key_path)
     os.chmod(key_path, 0o600)
