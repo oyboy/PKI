@@ -4,13 +4,14 @@ import sys
 import json
 
 from .logger import setup_logger
-from .ca import init_ca, issue_intermediate, issue_cert, verify_chain
+from .ca import init_ca, issue_intermediate, issue_cert, verify_chain, issue_ocsp_cert
 from .database import Database
 from .repository import run_server
 
 from .crypto_utils import load_certificate, load_private_key
 from .revocation import REASON_CODES
 from .crl import generate_crl
+from .ocsp_responder import run_ocsp_server
 
 def validate_key_params(args):
     if not hasattr(args, "key_type"):
@@ -165,6 +166,19 @@ def handle_gen_crl(args, logger):
     
     logger.info(f"SUCCESS: CRL saved to {out_path}")
 
+def handle_issue_ocsp_cert(args, logger):
+    issue_ocsp_cert(args, logger)
+
+def handle_ocsp_serve(args, logger):
+    run_ocsp_server(
+        args.host, 
+        args.port, 
+        args.db_path, 
+        args.responder_cert, 
+        args.responder_key, 
+        args.ca_cert,
+        args.cache_ttl
+    )
 
 def build_parser():
     parent = argparse.ArgumentParser(add_help=False)
@@ -254,6 +268,7 @@ def build_parser():
     revoke_p.add_argument("serial", help="Serial number in hex")
     revoke_p.add_argument("--reason", default="unspecified", choices=list(REASON_CODES.keys()))
     revoke_p.add_argument("--db-path", **db_path_arg)
+    revoke_p.add_argument("--force", action="store_true", help="Skip confirmation")
     revoke_p.set_defaults(func=handle_revoke)
 
     gen_crl_p = ca_subparsers.add_parser("gen-crl", help="Generate CRL")
@@ -267,6 +282,33 @@ def build_parser():
     gen_crl_p.add_argument("--ca-pass-file", default="./secrets/intermediate.pass")
     gen_crl_p.set_defaults(func=handle_gen_crl)
 
+    ocsp_cert_p = ca_subparsers.add_parser("issue-ocsp-cert", help="Issue an OCSP signing certificate")
+    ocsp_cert_p.add_argument("--ca-cert", required=True)
+    ocsp_cert_p.add_argument("--ca-key", required=True)
+    ocsp_cert_p.add_argument("--ca-pass-file", required=True)
+    ocsp_cert_p.add_argument("--subject", required=True)
+    ocsp_cert_p.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
+    ocsp_cert_p.add_argument("--key-size", type=int, default=2048)
+    ocsp_cert_p.add_argument("--san", action="append")
+    ocsp_cert_p.add_argument("--out-dir", default="./pki/certs")
+    ocsp_cert_p.add_argument("--validity-days", type=int, default=365)
+    ocsp_cert_p.add_argument("--db-path", **db_path_arg)
+    ocsp_cert_p.set_defaults(func=handle_issue_ocsp_cert)
+
+    ocsp_parser = subparsers.add_parser("ocsp", help="OCSP Responder commands")
+    ocsp_subparsers = ocsp_parser.add_subparsers(dest="action", required=True)
+    ocsp_serve_p = ocsp_subparsers.add_parser("serve", help="Run the OCSP responder")
+    ocsp_serve_p.add_argument("--host", default="127.0.0.1")
+    ocsp_serve_p.add_argument("--port", type=int, default=8081)
+    ocsp_serve_p.add_argument("--db-path", **db_path_arg)
+    ocsp_serve_p.add_argument("--responder-cert", required=True)
+    ocsp_serve_p.add_argument("--responder-key", required=True)
+    ocsp_serve_p.add_argument("--ca-cert", required=True)
+    ocsp_serve_p.add_argument("--cache-ttl", type=int, default=60, help="Cache TTL in seconds")
+    ocsp_serve_p.add_argument("--log-file", default=None, help="Path to log file")
+
+    ocsp_serve_p.set_defaults(func=handle_ocsp_serve)
+
     return parser
 
 
@@ -278,7 +320,12 @@ def main():
         sys.exit(1)
 
     args = parser.parse_args()
-    logger = setup_logger(args.log_file)
+
+    log_file = getattr(args, "log_file", None)
+    if hasattr(args, 'command'):
+        logger = setup_logger(args.log_file)
+    else:
+        logger = setup_logger(log_file, name="MicroPKI_CLI")
 
     try:
         if not hasattr(args, "func"):

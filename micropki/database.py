@@ -155,3 +155,10 @@ class Database:
                                (ca_subject, new_num, datetime.now(timezone.utc).isoformat()))
             conn.commit()
             return new_num
+
+    def get_cert_record_by_serial(self, serial_hex: str):
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM certificates WHERE serial_hex = ?", (serial_hex.upper(),))
+            return cursor.fetchone()

@@ -36,6 +36,17 @@ TEMPLATES = {
         "valid_san_types": ["dns", "uri"],
         "min_key_size": {"rsa": 2048, "ecc": 256}
     },
+    "ocsp": {
+        "key_usage": {
+            "digital_signature": True,
+            "content_commitment": False, "key_encipherment": False, "data_encipherment": False,
+            "key_agreement": False, "key_cert_sign": False, "crl_sign": False, "encipher_only": False,
+            "decipher_only": False,
+        },
+        "extended_key_usage": [ExtendedKeyUsageOID.OCSP_SIGNING],
+        "valid_san_types": ["dns", "uri"],
+        "min_key_size": {"rsa": 2048, "ecc": 256}
+    },
 }
 
 def parse_san(san_list: list[str]) -> list[x509.GeneralName]:

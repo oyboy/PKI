@@ -56,7 +56,7 @@ async def get_ca_certificate(level: str):
     
     return Response(content=pem, media_type="application/x-pem-file")
 
-@app.get("/crl")
+@app.api_route("/crl", methods=["GET", "HEAD"])
 async def get_crl(ca: str = "intermediate"):
     cert_dir = app.state.cert_dir
     crl_path = os.path.join(os.path.dirname(cert_dir), "crl", f"{ca}.crl.pem")

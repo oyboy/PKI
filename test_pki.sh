@@ -278,9 +278,9 @@ openssl crl -in ./pki/crl/intermediate.crl.pem -inform PEM -CAfile ./pki/certs/i
 ok "Подпись CRL подтверждена."
 
 info "--- [TEST-23] Проверка увеличения номера CRL ---"
-NUM1=$(openssl crl -in ./pki/pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
+NUM1=$(openssl crl -in ./pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
 python3 -m micropki ca gen-crl --ca intermediate --next-update 7
-NUM2=$(openssl crl -in ./pki/pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
+NUM2=$(openssl crl -in ./pki/crl/intermediate.crl.pem -text -noout | grep "CRL Number" -A 1 | tr -d '[:space:]' | cut -d':' -f2)
 
 if [ "$NUM2" -le "$NUM1" ]; then
     fail "Номер CRL не увеличился (было $NUM1, стало $NUM2)."
@@ -289,13 +289,13 @@ ok "Номер CRL успешно инкрементирован ($NUM1 -> $NUM2
 
 info "--- [TEST-24/25] Негативные тесты отзыва ---"
 set +e
-python3 -m micropki ca revoke "DEADC0DE" --reason keyCompromise --force 2>/dev/null
+python3 -m micropki ca revoke "DEADC0DE" --reason keyCompromise --force 2>&1
 RET=$?
 set -e
 [ $RET -ne 0 ] || fail "Отзыв несуществующего сертификата должен возвращать ошибку."
 ok "Тест на несуществующий серийник пройден."
 
-python3 -m micropki ca revoke "$SERIAL_REVOKE" --reason keyCompromise --force | grep -q "already revoked" || fail "Должно быть предупреждение об уже отозванном статусе."
+python3 -m micropki ca revoke "$SERIAL_REVOKE" --reason keyCompromise --force 2>&1 | grep -q "already revoked" || fail "Должно быть предупреждение об уже отозванном статусе."
 ok "Тест на повторный отзыв пройден."
 
 info "--- [TEST-26] Тест распространения CRL через API ---"
@@ -305,17 +305,99 @@ sleep 2
 
 curl -s http://localhost:8080/crl?ca=intermediate > downloaded.crl.pem
 diff downloaded.crl.pem ./pki/crl/intermediate.crl.pem || fail "CRL полученный по HTTP отличается от локального."
-curl -s -I http://localhost:8080/crl?ca=intermediate | grep -q "application/pkix-crl" || fail "Неверный Content-Type для CRL."
+curl -s -I http://localhost:8080/crl?ca=intermediate 2>&1 | grep -q "application/pkix-crl" || fail "Неверный Content-Type для CRL."
 
 kill $SERVER_PID
 SERVER_PID=""
 rm downloaded.crl.pem to-be-revoked.com.cert.pem to-be-revoked.com.key.pem
 ok "API успешно отдает файлы CRL."
 
-echo ""
-echo -e "${GREEN}======================================================"
-echo -e "    ВСЕ ТЕСТЫ (SPRINT 1-4) УСПЕШНО ПРОЙДЕНЫ!    "
-echo -e "======================================================${NC}"
+info "============================== SPRINT 5 =============================="
+
+info "--- [TEST-28] Выпуск и проверка сертификата OCSP-ответчика ---"
+python3 -m micropki ca issue-ocsp-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --subject "/CN=OCSP Responder" \
+    --key-type rsa \
+    --key-size 2048 \
+    --out-dir ./pki/certs \
+    --db-path ./pki/micropki.db
+
+[ -f ./pki/certs/ocsp.cert.pem ] || fail "Сертификат OCSP не создан."
+[ -f ./pki/certs/ocsp.key.pem ] || fail "Ключ OCSP не создан."
+
+CERT_TEXT_OCSP=$(openssl x509 -in ./pki/certs/ocsp.cert.pem -text -noout)
+echo "$CERT_TEXT_OCSP" | grep -q "OCSP Signing" || fail "Отсутствует расширение EKU OCSPSigning."
+echo "$CERT_TEXT_OCSP" | grep -A 1 "Key Usage" | grep -q "Digital Signature" || fail "Отсутствует Key Usage Digital Signature."
+ok "Сертификат OCSP-ответчика корректен."
+
+info "--- Запуск OCSP-ответчика ---"
+python3 -m micropki ocsp serve \
+    --port 8081 \
+    --db-path ./pki/micropki.db \
+    --responder-cert ./pki/certs/ocsp.cert.pem \
+    --responder-key ./pki/certs/ocsp.key.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --cache-ttl 60 &
+OCSP_PID=$!
+sleep 2
+
+info "--- [TEST-29/32] OCSP запрос: GOOD статус и Nonce ---"
+python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "/CN=ocsp-test-good.com" \
+    --san dns:ocsp-test-good.com \
+    --out-dir .
+
+openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \
+             -cert ocsp-test-good.com.cert.pem \
+             -url http://127.0.0.1:8081/ocsp \
+             -VAfile ./pki/certs/ocsp.cert.pem \
+             -nonce -respout resp_good.der > ocsp_res.txt 2>&1
+
+grep -q "ocsp-test-good.com.cert.pem: good" ocsp_res.txt || fail "Неверный статус OCSP (ожидался good)."
+grep -q "Response verify OK" ocsp_res.txt || fail "Подпись OCSP ответа невалидна."
+ok "Статус GOOD и подпись подтверждены."
+
+info "--- [TEST-30] OCSP запрос: REVOKED статус ---"
+SERIAL_OCSP_REVOKE=$(python3 -m micropki ca list-certs --format csv | grep "ocsp-test-good.com" | cut -d, -f1)
+python3 -m micropki ca revoke "$SERIAL_OCSP_REVOKE" --reason keyCompromise --force
+
+openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \
+             -cert ocsp-test-good.com.cert.pem \
+             -url http://127.0.0.1:8081/ocsp \
+             -VAfile ./pki/certs/ocsp.cert.pem > ocsp_res.txt 2>&1
+
+grep -q "ocsp-test-good.com.cert.pem: revoked" ocsp_res.txt || fail "Неверный статус OCSP (ожидался revoked)."
+grep -q "Reason: keyCompromise" ocsp_res.txt || fail "В ответе OCSP отсутствует причина отзыва."
+ok "Статус REVOKED и причина подтверждены."
+
+info "--- [TEST-31] OCSP запрос: UNKNOWN статус (через unauthorized) ---"
+openssl genrsa -out unknown.key 2048
+openssl req -new -key unknown.key -out unknown.csr -subj "/CN=unknown.com"
+openssl x509 -req -in unknown.csr -signkey unknown.key -out unknown.cert.pem -days 1 > /dev/null 2>&1
+
+openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \
+             -cert unknown.cert.pem \
+             -url http://127.0.0.1:8081/ocsp \
+             -VAfile ./pki/certs/ocsp.cert.pem > ocsp_res.txt 2>&1
+grep -q "Responder Error: unauthorized" ocsp_res.txt || fail "Сервер не вернул unauthorized на неизвестный сертификат."
+ok "Статус UNKNOWN (unauthorized) подтвержден."
+
+info "--- [TEST-34] Негативный тест: Malformed Request ---"
+set +e
+curl -s -X POST --data "not-a-request" -H "Content-Type: application/ocsp-request" http://127.0.0.1:8081/ocsp > malformed_res.bin
+openssl ocsp -respin malformed_res.bin -text -noverify | grep -q "Responder Error: malformedRequest" || fail "Сервер не вернул malformedRequest на мусорные данные."
+set -e
+ok "Тест на некорректный запрос пройден."
+
+kill $OCSP_PID
+rm ocsp_test-good.com.cert.pem ocsp_test-good.com.key.pem ocsp_res.txt unknown.cert.pem unknown.key unknown.csr resp_good.der malformed_res.bin
 
 echo ""
 echo -e "${GREEN}========================================="

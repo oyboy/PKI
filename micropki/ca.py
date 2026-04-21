@@ -258,3 +258,63 @@ def update_policy_for_intermediate(args, cert):
     
     with open(policy_path, "a", encoding="utf-8") as f:
         f.write(new_entry)
+
+def issue_ocsp_cert(args, logger):
+    logger.info("--- Issuing OCSP Signing Certificate ---")
+    
+    with open(args.ca_pass_file, "rb") as f:
+        ca_pass = f.read().strip()
+    ca_key = load_private_key(args.ca_key, ca_pass)
+    ca_cert = load_certificate(args.ca_cert)
+
+    logger.warning("Generating unencrypted key for OCSP Responder")
+    responder_key = generate_key(args.key_type, args.key_size)
+    
+    subject = parse_dn(args.subject)
+    template = TEMPLATES["ocsp"]
+    
+    builder = x509.CertificateBuilder()
+    builder = builder.subject_name(subject)
+    builder = builder.issuer_name(ca_cert.subject)
+    builder = builder.public_key(responder_key.public_key())
+    builder = builder.serial_number(generate_unique_serial())
+    builder = builder.not_valid_before(datetime.now(timezone.utc))
+    builder = builder.not_valid_after(datetime.now(timezone.utc) + timedelta(days=args.validity_days))
+
+    builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    builder = builder.add_extension(x509.KeyUsage(**template["key_usage"]), critical=True)
+    builder = builder.add_extension(x509.ExtendedKeyUsage(template["extended_key_usage"]), critical=False)
+    
+    ocsp_url = None
+    if args.san:
+        for san in args.san:
+            if san.startswith("dns:"):
+                ocsp_url = f"http://{san.split(':',1)[1]}"
+                break
+    if not ocsp_url:
+        ocsp_url = "http://ocsp.local"
+    builder = builder.add_extension(
+        x509.AuthorityInformationAccess([
+            x509.AccessDescription(
+                x509.AuthorityInformationAccessOID.OCSP,
+                x509.UniformResourceIdentifier(ocsp_url)
+            )
+        ]),
+        critical=False
+    )
+
+    cert = builder.sign(ca_key, hashes.SHA256())
+    
+    os.makedirs(args.out_dir, exist_ok=True)
+    base_name = "ocsp"
+    cert_path = os.path.join(args.out_dir, f"{base_name}.cert.pem")
+    key_path = os.path.join(args.out_dir, f"{base_name}.key.pem")
+    
+    save_cert(cert, cert_path)
+    save_unencrypted_key(responder_key, key_path)
+    os.chmod(key_path, 0o600)
+    
+    db = Database(args.db_path, logger)
+    db.insert_cert(cert)
+    
+    logger.info(f"SUCCESS: OCSP Responder cert: {cert_path}")
