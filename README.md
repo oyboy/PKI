@@ -471,6 +471,110 @@ curl -X POST http://127.0.0.1:8081/ocsp \
 
 В логах фиксируются запросы, серийные номера сертификатов, итоговый статус (`good`, `revoked`, `unknown`) и ошибки обработки.
 
+# Клиентские команды
+
+### Генерация **CSR**
+
+```
+python3 -m micropki client gen-csr \
+    --subject */CN=myapp.local,O=MyOrg* \
+    --key-type rsa \
+    --key-size **2048** \
+    --san dns:myapp.local \
+    --san dns:https://www.myapp.local \
+    --out-key ./myapp.key.pem \
+    --out-csr ./myapp.csr.pem
+```
+
+Параметры:
+
+- `--subject` — DN субъекта (обязательно)
+- `--key-type` — тип ключа: `rsa` или `ecc` (по умолчанию: `rsa`)
+- `--key-size` — размер ключа: `**2048**`/`**4096**` для **RSA**, `**256**`/`**384**` для **ECC**
+- `--san` — **SAN**-запись, флаг можно указывать несколько раз
+- `--out-key` — файл для сохранения закрытого ключа (по умолчанию: `./key.pem`)
+- `--out-csr` — файл для сохранения **CSR** (по умолчанию: `./request.csr.pem`)
+
+Закрытый ключ сохраняется незашифрованным с правами доступа `**0600**`.
+
+### Запрос сертификата по **CSR**
+
+```
+python3 -m micropki client request-cert \
+    --csr ./myapp.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 \
+    --out-cert ./app.cert.pem
+```
+
+Параметры:
+
+- `--csr` — путь к файлу **CSR** (обязательно)
+- `--template` — шаблон сертификата: `server`, `client`, `code_signing`
+- `--ca-url` — базовый **URL** сервера репозитория (по умолчанию: `[http://localhost:**8080**`](http://localhost:**8080**`))
+- `--out-cert` — файл для сохранения полученного сертификата (по умолчанию: `./cert.pem`)
+
+Проверка цепочки сертификатов
+
+```
+**Простая проверка цепочки и сроков действия**
+python3 -m micropki client validate \
+    --cert ./app.cert.pem \
+    --untrusted ./pki/certs/intermediate.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --mode chain
+
+**Полная проверка с использованием CRL**
+
+python3 -m micropki client validate \
+    --cert ./app.cert.pem \
+    --untrusted ./pki/certs/intermediate.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --mode full \
+    --crl http://localhost:**8080**/crl?ca=intermediate
+
+**Проверка с переопределением времени**
+
+python3 -m micropki client validate \
+    --cert ./app.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --validation-time ***2025**-01-**01T12**:00:00*
+```
+
+Параметры:
+
+- `--cert` — путь к конечному сертификату (обязательно)
+- `--untrusted` — промежуточный сертификат, флаг можно указывать несколько раз
+- `--trusted` — корневой сертификат доверия (по умолчанию: `./pki/certs/ca.cert.pem`)
+- `--mode` — режим проверки: `chain` или `full`
+- `--crl` — **URL** или путь к файлу **CRL**
+- `--ocsp-url` — явный **URL** **OCSP**-ответчика
+- `--validation-time` — время проверки в формате **ISO**
+
+### Проверка статуса отзыва
+
+```
+# Автоматический поиск OCSP через AIA, затем CRL через CDP
+python3 -m micropki client check-status \
+    --cert ./app.cert.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem
+
+# Явное указание OCSP и CRL
+
+python3 -m micropki client check-status \
+    --cert ./app.cert.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ocsp-url http://localhost:8081/ocsp \
+    --crl ./pki/crl/intermediate.crl.pem
+```
+
+Параметры:
+
+- `--cert` — проверяемый сертификат (обязательно)
+- `--ca-cert` — сертификат издателя (обязательно)
+- `--ocsp-url` — ручное указание адреса **OCSP**-ответчика
+- `--crl` — ручное указание адреса или пути к **CRL**
+
 ## Проверка и верификация
 
 ### Проверка цепочки сертификатов
