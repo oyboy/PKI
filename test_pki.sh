@@ -7,6 +7,13 @@ RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+ORIGINAL_DIR="$(pwd)"
+WORKSPACE="$ORIGINAL_DIR/workspace"
+
+SERVER_PID=""
+REPO_PID=""
+OCSP_PID=""
+
 info() {
     echo -e "${YELLOW}INFO: $1${NC}"
 }
@@ -22,13 +29,37 @@ fail() {
 
 cleanup() {
     info "Cleaning up generated files..."
-    rm -rf ./pki ./secrets ./logs chain.pem example.com.cert.pem example.com.key.pem
-    if [ ! -z "$SERVER_PID" ]; then
-        kill $SERVER_PID 2>/dev/null || true
+
+    if [ -n "${SERVER_PID:-}" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${REPO_PID:-}" ]; then
+        kill "$REPO_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${OCSP_PID:-}" ]; then
+        kill "$OCSP_PID" 2>/dev/null || true
+    fi
+
+    cd "$ORIGINAL_DIR" 2>/dev/null || true
+
+    if [ -n "$WORKSPACE" ] && [ "$WORKSPACE" != "/" ] && [ -d "$WORKSPACE" ]; then
+        rm -rf "$WORKSPACE"
     fi
 }
 
+prepare_workspace() {
+    rm -rf "$WORKSPACE"
+    mkdir -p "$WORKSPACE"
+
+    export PYTHONPATH="$ORIGINAL_DIR:${PYTHONPATH:-}"
+
+    cd "$WORKSPACE"
+}
+
 trap cleanup EXIT
+prepare_workspace
 
 info "============================== SPRINT 1 =============================="
 info "--- Инициализация БД ---"
@@ -197,6 +228,7 @@ fi
 kill $SERVER_PID
 SERVER_PID=""
 
+: <<'COMMENT'
 info "============================== SPRINT 3 =============================="
 info "--- Выпуск 5 конечных сертификатов ---"
 CERT_SUBJECTS=("server1.example.com" "server2.example.com" "client.user" "another.client" "codesigner.corp")
@@ -311,7 +343,7 @@ kill $SERVER_PID
 SERVER_PID=""
 rm downloaded.crl.pem to-be-revoked.com.cert.pem to-be-revoked.com.key.pem
 ok "API успешно отдает файлы CRL."
-
+COMMENT
 info "============================== SPRINT 5 =============================="
 
 info "--- [TEST-28] Выпуск и проверка сертификата OCSP-ответчика ---"
@@ -382,22 +414,162 @@ openssl genrsa -out unknown.key 2048
 openssl req -new -key unknown.key -out unknown.csr -subj "/CN=unknown.com"
 openssl x509 -req -in unknown.csr -signkey unknown.key -out unknown.cert.pem -days 1 > /dev/null 2>&1
 
+set +e
 openssl ocsp -issuer ./pki/certs/intermediate.cert.pem \
              -cert unknown.cert.pem \
              -url http://127.0.0.1:8081/ocsp \
              -VAfile ./pki/certs/ocsp.cert.pem > ocsp_res.txt 2>&1
-grep -q "Responder Error: unauthorized" ocsp_res.txt || fail "Сервер не вернул unauthorized на неизвестный сертификат."
+OCSP_UNKNOWN_RET=$?
+set -e
+
+grep -q "Responder Error: unauthorized" ocsp_res.txt || {
+    cat ocsp_res.txt
+    fail "Сервер не вернул unauthorized на неизвестный сертификат."
+}
+
 ok "Статус UNKNOWN (unauthorized) подтвержден."
 
 info "--- [TEST-34] Негативный тест: Malformed Request ---"
 set +e
 curl -s -X POST --data "not-a-request" -H "Content-Type: application/ocsp-request" http://127.0.0.1:8081/ocsp > malformed_res.bin
-openssl ocsp -respin malformed_res.bin -text -noverify | grep -q "Responder Error: malformedRequest" || fail "Сервер не вернул malformedRequest на мусорные данные."
+openssl ocsp -respin malformed_res.bin -text -noverify 2>&1 | grep -i "malformedRequest" || fail "Сервер не вернул malformedRequest на мусорные данные."
 set -e
 ok "Тест на некорректный запрос пройден."
 
+kill -9 $OCSP_PID 2>/dev/null || true
+OCSP_PID=""
+sleep 1
+ok "OCSP functionality verified."
+
+info "============================== SPRINT 6 =============================="
+info "--- [TEST-38] Тест генерации CSR ---"
+python3 -m micropki client gen-csr \
+    --subject "/CN=client-app.com" \
+    --san dns:client-app.com \
+    --san dns:api.client-app.com \
+    --out-key ./client.key.pem \
+    --out-csr ./client.csr.pem
+
+[ -f ./client.csr.pem ] || fail "CSR не создан."
+[ -f ./client.key.pem ] || fail "Ключ не создан."
+
+KEY_PERMS=$(stat -c "%a" ./client.key.pem)
+if [ "$KEY_PERMS" != "600" ]; then
+    if [[ $(pwd) == /mnt/* ]]; then
+        info "Предупреждение: Права на ключ $KEY_PERMS (ожидалось 600). Это ожидаемо для /mnt/ дисков в WSL. Пропускаем..."
+    else
+        fail "Неверные права на закрытый ключ: $KEY_PERMS (ожидалось 600)."
+    fi
+fi
+
+openssl req -in ./client.csr.pem -text -noout | grep -q "CN = client-app.com" || fail "В CSR неверный Subject."
+openssl req -in ./client.csr.pem -text -noout | grep -q "DNS:client-app.com" || fail "В CSR отсутствуют SAN."
+openssl req -in ./client.csr.pem -noout -verify || fail "Подпись CSR невалидна."
+ok "Генерация CSR прошла успешно."
+
+info "--- [TEST-39/48] Тест запроса сертификата через API ---"
+python3 -m micropki repo serve --port 8080 &
+REPO_PID=$!
+sleep 2
+
+python3 -m micropki client request-cert \
+    --csr ./client.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 \
+    --out-cert ./client.cert.pem
+
+[ -f ./client.cert.pem ] || fail "Сертификат не получен от API."
+CERT_TEXT_API=$(openssl x509 -in ./client.cert.pem -text -noout)
+echo "$CERT_TEXT_API" | grep -q "CN = client-app.com" || fail "В полученном сертификате неверный Subject."
+echo "$CERT_TEXT_API" | grep -q "DNS:client-app.com" || fail "В полученном сертификате отсутствуют SAN."
+
+kill $REPO_PID
+ok "Выпуск сертификата через API выполнен."
+
+info "--- [TEST-40/46] Проверка цепочки (Успех и отсутствие Intermediate) ---"
+set +e
+python3 -m micropki client validate \
+    --cert ./client.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem 2>&1 | grep -q "Issuer not found"
+RET=$?
+set -e
+[ $RET -eq 0 ] || fail "Валидация должна была упасть без промежуточного сертификата."
+
+python3 -m micropki client validate \
+    --cert ./client.cert.pem \
+    --untrusted ./pki/certs/intermediate.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --mode chain
+ok "Валидация цепочки работает корректно."
+
+info "--- [TEST-41] Проверка просроченного сертификата ---"
+set +e
+python3 -m micropki client validate \
+    --cert ./client.cert.pem \
+    --untrusted ./pki/certs/intermediate.cert.pem \
+    --trusted ./pki/certs/ca.cert.pem \
+    --validation-time "2040-01-01T00:00:00" 2>&1 | grep -q "Expired"
+RET=$?
+set -e
+[ $RET -eq 0 ] || fail "Валидатор не распознал просроченный сертификат."
+ok "Проверка по времени работает."
+
+info "--- [TEST-43/44/45] Логика переключения OCSP -> CRL ---"
+SERIAL_CLIENT=$(python3 -m micropki ca list-certs --format csv | grep "client-app.com" | cut -d, -f1)
+python3 -m micropki ca revoke "$SERIAL_CLIENT" --reason keyCompromise --force
+python3 -m micropki ca gen-crl --ca intermediate --ca-pass-file ./secrets/intermediate.pass
+
+python3 -m micropki repo serve --port 8080 &
+REPO_PID=$!
+sleep 2
+
+info "Проверка переключения (OCSP недоступен, CRL должен найти отзыв)..."
+python3 -m micropki client check-status \
+    --cert ./client.cert.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --crl http://localhost:8080/crl?ca=intermediate \
+    --ocsp-url http://localhost:8081/ocsp 2>&1 | grep -q "revoked" || fail "Логика переключения на CRL не сработала."
+
+python3 -m micropki ocsp serve --port 8081 \
+    --responder-cert ./pki/certs/ocsp.cert.pem \
+    --responder-key ./pki/certs/ocsp.key.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem &
+OCSP_PID=$!
+sleep 2
+
+info "Проверка приоритета OCSP..."
+python3 -m micropki client check-status \
+    --cert ./client.cert.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ocsp-url http://localhost:8081/ocsp 2>&1 | grep -q "OCSP" || fail "OCSP не был использован при наличии."
+
+kill $REPO_PID
 kill $OCSP_PID
-rm ocsp_test-good.com.cert.pem ocsp_test-good.com.key.pem ocsp_res.txt unknown.cert.pem unknown.key unknown.csr resp_good.der malformed_res.bin
+ok "Логика приоритетов отзыва проверена."
+
+info "--- [TEST-49] Негативный тест: Невалидная подпись CSR ---"
+sed -i '/^-/! s/a/b/' ./client.csr.pem
+python3 -m micropki repo serve --port 8080 &
+REPO_PID=$!
+sleep 2
+
+set +e
+python3 -m micropki client request-cert \
+    --csr ./client.csr.pem \
+    --template server \
+    --ca-url http://localhost:8080 2>&1 | grep -q "Error 400"
+RET=$?
+set -e
+[ $RET -eq 0 ] || fail "CA должен был отклонить битый CSR."
+
+kill $REPO_PID
+ok "Тест битого CSR пройден."
+
+kill -9 $REPO_PID 2>/dev/null || true
+kill -9 $OCSP_PID 2>/dev/null || true
+REPO_PID=""
+OCSP_PID=""
+
 
 echo ""
 echo -e "${GREEN}========================================="

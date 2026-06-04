@@ -12,6 +12,9 @@ from .crypto_utils import load_certificate, load_private_key
 from .revocation import REASON_CODES
 from .crl import generate_crl
 from .ocsp_responder import run_ocsp_server
+from .client import (
+    client_gen_csr, client_request_cert, client_validate, client_check_status
+)
 
 def validate_key_params(args):
     if not hasattr(args, "key_type"):
@@ -309,6 +312,43 @@ def build_parser():
 
     ocsp_serve_p.set_defaults(func=handle_ocsp_serve)
 
+    client_parser = subparsers.add_parser("client", help="Client side tools", parents=[parent])
+    client_sub = client_parser.add_subparsers(dest="action", required=True)
+
+    csr_p = client_sub.add_parser("gen-csr", help="Generate Private Key and CSR", parents=[parent])
+    csr_p.add_argument("--subject", required=True)
+    csr_p.add_argument("--key-type", choices=["rsa", "ecc"], default="rsa")
+    csr_p.add_argument("--key-size", type=int)
+    csr_p.add_argument("--san", action="append")
+    csr_p.add_argument("--out-key", default="./key.pem")
+    csr_p.add_argument("--out-csr", default="./request.csr.pem")
+    csr_p.set_defaults(func=client_gen_csr)
+    
+    req_p = client_sub.add_parser("request-cert", help="Send CSR to CA", parents=[parent])
+    req_p.add_argument("--csr", required=True)
+    req_p.add_argument("--template", choices=["server", "client", "code_signing"], required=True)
+    req_p.add_argument("--ca-url", default="http://localhost:8080")
+    req_p.add_argument("--out-cert", default="./cert.pem")
+    req_p.set_defaults(func=client_request_cert)
+
+    val_p = client_sub.add_parser("validate", parents=[parent])
+    val_p.add_argument("--cert", required=True)
+    val_p.add_argument("--untrusted", action="append")
+    val_p.add_argument("--trusted", default="./pki/certs/ca.cert.pem")
+    val_p.add_argument("--crl")
+    val_p.add_argument("--ocsp", action="store_true")
+    val_p.add_argument("--ocsp-url")
+    val_p.add_argument("--mode", choices=["chain", "full"], default="full")
+    val_p.add_argument("--validation-time")
+    val_p.set_defaults(func=client_validate)
+
+    status_p = client_sub.add_parser("check-status", help="Check revocation status", parents=[parent])
+    status_p.add_argument("--cert", required=True)
+    status_p.add_argument("--ca-cert", required=True)
+    status_p.add_argument("--crl")
+    status_p.add_argument("--ocsp-url")
+    status_p.set_defaults(func=client_check_status)
+
     return parser
 
 
@@ -333,7 +373,7 @@ def main():
         args.func(args, logger)
     except ValueError as e:
         logger.error(str(e))
-        sys.exit(2)
+        sys.exit(1)
     except Exception:
         logger.exception("Unexpected failure")
         sys.exit(1)

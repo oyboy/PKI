@@ -207,3 +207,18 @@ def generate_unique_serial() -> int:
 
     serial = (timestamp << 64) | random_part
     return serial
+
+def generate_csr(private_key, subject_str, san_list=None):
+    subject = parse_dn(subject_str)
+    builder = x509.CertificateSigningRequestBuilder().subject_name(subject)
+    
+    if san_list:
+        from .templates import parse_san
+        sans = parse_san(san_list)
+        builder = builder.add_extension(x509.SubjectAlternativeName(sans), critical=False)
+    
+    csr = builder.sign(private_key, hashes.SHA256())
+    return csr.public_bytes(serialization.Encoding.PEM)
+
+def load_csr(csr_pem_bytes):
+    return x509.load_pem_x509_csr(csr_pem_bytes)

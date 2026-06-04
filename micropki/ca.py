@@ -10,7 +10,7 @@ from .crypto_utils import (
 )
 from .templates import TEMPLATES, parse_san
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from .database import Database
 
@@ -154,47 +154,50 @@ def issue_intermediate(args, logger):
     logger.info(f"  Cert: {cert_path}")
     update_policy_for_intermediate(args, intermediate_cert)
 
-def issue_cert(args, logger):
+def issue_cert(args, logger, csr_obj=None):
     logger.info(f"=== Starting certificate issuance with template '{args.template}' ===")
 
-    if args.template == "server" and not args.san:
-        logger.error("Server certificate requires SAN")
-        sys.exit(1)
-        
-    logger.info(f"Loading signing CA from {args.ca_cert} and {args.ca_key}")
     with open(args.ca_pass_file, "rb") as f:
         ca_pass = f.read().strip()
     ca_key = load_private_key(args.ca_key, ca_pass)
     ca_cert = load_certificate(args.ca_cert)
-
     template = TEMPLATES[args.template]
-    try:
+
+    entity_private_key = None
+    san_names = []
+    
+    if csr_obj:
+        if not csr_obj.is_signature_valid:
+            logger.error("CSR signature is invalid!")
+            raise ValueError("CSR signature is invalid")
+            
+        logger.info("Using data from provided CSR")
+        subject = csr_obj.subject
+        public_key = csr_obj.public_key()
+        
+        try:
+            san_ext = csr_obj.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            san_names = san_ext.value
+        except x509.ExtensionNotFound:
+            pass
+    else:
+        logger.info("No CSR provided. Generating new private key...")
+        entity_private_key = generate_key("rsa", 2048)
+        public_key = entity_private_key.public_key()
+        subject = parse_dn(args.subject)
+        
         san_list = args.san or []
-        for san_str in san_list:
-            if ":" not in san_str:
-                logger.error(f"Invalid SAN format: {san_str}")
-                sys.exit(1)
-            san_type = san_str.split(":", 1)[0].lower().strip()
-            if san_type not in template["valid_san_types"]:
-                logger.error(f"SAN type '{san_type}' is not allowed for template '{args.template}'")
-                sys.exit(1)
-        san_ext = parse_san(san_list)
-    except ValueError as e:
-        logger.error(f"Invalid SAN: {e}")
-        sys.exit(1)
+        if san_list:
+            san_names = parse_san(san_list)
 
-    key_type = "rsa"
-    key_size = 2048
-    logger.info(f"Generating new {key_type.upper()} key ({key_size} bits) for end-entity")
-    entity_key = generate_key(key_type, key_size)
-
-    subject = parse_dn(args.subject)
-    hash_alg = hashes.SHA256() if isinstance(ca_key, rsa.RSAPrivateKey) else hashes.SHA384()
+    if args.template == "server" and not san_names:
+        logger.error("Server certificate requires SAN")
+        raise ValueError("Server certificate requires SAN")
 
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(ca_cert.subject)
-    builder = builder.public_key(entity_key.public_key())
+    builder = builder.public_key(public_key)
     builder = builder.serial_number(generate_unique_serial())
     builder = builder.not_valid_before(datetime.now(timezone.utc))
     builder = builder.not_valid_after(datetime.now(timezone.utc) + timedelta(days=args.validity_days))
@@ -202,41 +205,40 @@ def issue_cert(args, logger):
     builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
     builder = builder.add_extension(x509.KeyUsage(**template["key_usage"]), critical=True)
     builder = builder.add_extension(x509.ExtendedKeyUsage(template["extended_key_usage"]), critical=False)
-    if san_ext:
-        builder = builder.add_extension(x509.SubjectAlternativeName(san_ext), critical=False)
+    
+    if san_names:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_names), critical=False)
     
     builder = builder.add_extension(
         x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()), critical=False
     )
     builder = builder.add_extension(
-        x509.SubjectKeyIdentifier.from_public_key(entity_key.public_key()), critical=False
+        x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
     )
-    
+
+    hash_alg = hashes.SHA256() if isinstance(ca_key, rsa.RSAPrivateKey) else hashes.SHA384()
     entity_cert = builder.sign(ca_key, hash_alg)
+
+    try:
+        cn = subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
+    except IndexError:
+        cn = "cert_" + hex(entity_cert.serial_number)[2:10]
     
-    cn = subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-    base_name = cn.replace(" ", "_").lower()
+    base_name = cn.replace(" ", "_").replace("*", "wildcard").lower()
     cert_path = os.path.join(args.out_dir, f"{base_name}.cert.pem")
     key_path = os.path.join(args.out_dir, f"{base_name}.key.pem")
 
-    enforce_leaf_constraints(entity_cert)
-
     save_cert(entity_cert, cert_path)
+    db = Database(args.db_path, logger)
+    db.insert_cert(entity_cert)
 
-    try:
-        db = Database(args.db_path, logger)
-        db.insert_cert(entity_cert)
-    except Exception as e:
-        logger.error(f"FATAL: Could not write cert to database. Aborting. Error: {e}")
-        sys.exit(1)
+    if entity_private_key:
+        logger.warning(f"Saving newly generated unencrypted private key to {key_path}")
+        save_unencrypted_key(entity_private_key, key_path)
+        os.chmod(key_path, 0o600)
 
-    logger.info(f"SUCCESS: Certificate for '{cn}' issued and recorded in the database.")
-    
-    logger.warning(f"Saving unencrypted private key to {key_path}")
-    save_unencrypted_key(entity_key, key_path)
-    os.chmod(key_path, 0o600)
-    
     logger.info(f"SUCCESS: Certificate for '{cn}' issued.")
+    return entity_cert
 
 def enforce_leaf_constraints(cert):
     bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value

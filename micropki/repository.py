@@ -2,6 +2,7 @@ import os
 import uvicorn
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from cryptography.hazmat.primitives import serialization
 import logging
 import re
 
@@ -82,3 +83,36 @@ def run_server(host: str, port: int, db_path: str, cert_dir: str):
     app.state.cert_dir = cert_dir
     http_logger.info(f"Starting MicroPKI repository server on {host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
+
+@app.post("/request-cert", status_code=201)
+async def api_request_cert(request: Request, template: str):
+    api_key = request.headers.get("X-API-Key")
+    if api_key != "changeme":
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+
+    csr_pem = await request.body()
+    try:
+        from .crypto_utils import load_csr
+        from .ca import issue_cert
+        from types import SimpleNamespace
+        
+        csr_obj = load_csr(csr_pem)
+        fake_args = SimpleNamespace(
+            template=template, 
+            out_dir="./pki/certs", 
+            db_path=app.state.db_path,
+            ca_cert=os.path.join(app.state.cert_dir, "intermediate.cert.pem"),
+            ca_key=os.path.join(os.path.dirname(app.state.cert_dir), "private/intermediate.key.pem"),
+            ca_pass_file="./secrets/intermediate.pass",
+            validity_days=365
+        )
+        
+        cert = issue_cert(fake_args, http_logger, csr_obj=csr_obj)
+        return Response(
+            content=cert.public_bytes(serialization.Encoding.PEM), 
+            media_type="application/x-pem-file",
+            status_code=201
+        )
+    except Exception as e:
+        http_logger.error(f"API Cert Issuance failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
