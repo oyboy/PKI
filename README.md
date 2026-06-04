@@ -218,6 +218,259 @@ curl http://localhost:8080/crl?ca=intermediate
 curl http://localhost:8080/certificate/XYZ
 ```
 
+## OCSP-ответчик
+
+OCSP-ответчик позволяет в реальном времени проверять статус сертификата: действительный, отозванный или неизвестный.
+В проект добавлены модули:
+
+```text
+micropki/ocsp.py
+micropki/ocsp_responder.py
+```
+
+Опционально в каталоге PKI можно хранить логи или кэш OCSP:
+
+```text
+pki/
+├── private/
+├── certs/
+├── crl/
+├── ocsp/
+├── micropki.db
+└── policy.txt
+```
+
+### Выпуск сертификата OCSP-ответчика
+
+Для подписи OCSP-ответов используется отдельный сертификат с расширением `OCSPSigning`.
+
+```shell
+micropki ca issue-ocsp-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --subject "CN=OCSP Responder,O=MicroPKI" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:localhost \
+    --out-dir ./pki/certs \
+    --validity-days 365 \
+    --db-path ./pki/micropki.db
+```
+
+После выполнения команды будут созданы файлы:
+
+```text
+./pki/certs/ocsp.cert.pem
+./pki/certs/ocsp.key.pem
+```
+
+Закрытый ключ OCSP-ответчика сохраняется без шифрования, чтобы сервер мог загрузить его автоматически при запуске. Файл ключа должен иметь права доступа `600`.
+
+Проверить расширения OCSP-сертификата можно так:
+
+```shell
+openssl x509 -in ./pki/certs/ocsp.cert.pem -text -noout
+```
+
+В выводе должны присутствовать:
+
+```text
+X509v3 Key Usage: Digital Signature
+X509v3 Extended Key Usage: OCSP Signing
+X509v3 Basic Constraints: CA:FALSE
+```
+
+### Запуск OCSP-ответчика
+
+OCSP-ответчик запускается отдельной командой:
+
+```shell
+micropki ocsp serve \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --db-path ./pki/micropki.db \
+    --responder-cert ./pki/certs/ocsp.cert.pem \
+    --responder-key ./pki/certs/ocsp.key.pem \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --cache-ttl 120 \
+    --log-file ./logs/ocsp.log
+```
+
+Сервер принимает OCSP-запросы методом `POST` по адресу:
+
+```text
+http://127.0.0.1:8081/ocsp
+```
+
+Ответы возвращаются в DER-формате с типом содержимого:
+
+```text
+application/ocsp-response
+```
+
+### Проверка статуса сертификата через OpenSSL
+
+Перед проверкой должен быть выпущен обычный серверный сертификат, например:
+
+```shell
+micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "CN=example.com,O=MicroPKI" \
+    --san dns:example.com \
+    --out-dir ./pki/certs \
+    --validity-days 365 \
+    --db-path ./pki/micropki.db
+```
+
+Проверка действительного сертификата:
+
+```shell
+openssl ocsp \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -cert ./pki/certs/example.com.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -respout ./pki/ocsp/response.der \
+    -text
+```
+
+Ожидаемый результат:
+
+```text
+./pki/certs/example.com.cert.pem: good
+Response verify OK
+```
+
+### Проверка отозванного сертификата
+
+Сначала нужно отозвать сертификат:
+
+```shell
+micropki ca list-certs --db-path ./pki/micropki.db
+
+micropki ca revoke <SERIAL_NUMBER> \
+    --reason keyCompromise \
+    --db-path ./pki/micropki.db \
+    --force
+```
+
+Затем повторить OCSP-запрос:
+
+```shell
+openssl ocsp \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -cert ./pki/certs/example.com.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -text
+```
+
+Ожидаемый результат:
+
+```text
+./pki/certs/example.com.cert.pem: revoked
+```
+
+В ответе также должна отображаться дата отзыва и причина отзыва.
+
+### Проверка неизвестного сертификата
+
+Для проверки неизвестного сертификата можно отправить запрос по серийному номеру, которого нет в базе:
+
+```shell
+openssl ocsp \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -serial 1234567890ABCDEF \
+    -url http://127.0.0.1:8081/ocsp \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -text
+```
+
+Ожидаемый результат — статус `unknown` или отказ `unauthorized`, если ответчик не обслуживает указанный сертификат или издателя.
+
+### Проверка сохранённого OCSP-ответа
+
+Если ответ был сохранён через параметр `-respout`, его можно проверить отдельно:
+
+```shell
+openssl ocsp \
+    -respin ./pki/ocsp/response.der \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -cert ./pki/certs/example.com.cert.pem \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -text
+```
+
+Ожидаемый результат:
+
+```text
+Response verify OK
+```
+
+### Проверка nonce
+
+Nonce — это случайное значение внутри OCSP-запроса. Оно нужно для защиты от повторного использования старого ответа: клиент отправляет nonce, а сервер обязан вернуть точно такое же значение в OCSP-ответе.
+
+OpenSSL обычно добавляет nonce автоматически. Проверка запроса с nonce:
+
+```shell
+openssl ocsp \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -cert ./pki/certs/example.com.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -text
+```
+
+В выводе должны присутствовать расширения OCSP nonce в запросе и ответе.
+
+Проверка запроса без nonce:
+
+```shell
+openssl ocsp \
+    -issuer ./pki/certs/intermediate.cert.pem \
+    -cert ./pki/certs/example.com.cert.pem \
+    -url http://127.0.0.1:8081/ocsp \
+    -VAfile ./pki/certs/ocsp.cert.pem \
+    -CAfile ./pki/certs/intermediate.cert.pem \
+    -no_nonce \
+    -text
+```
+
+В этом случае ответ не должен содержать nonce.
+
+### Негативная проверка некорректного OCSP-запроса
+
+Можно отправить мусорные данные вместо DER-кодированного OCSP-запроса:
+
+```shell
+curl -X POST http://127.0.0.1:8081/ocsp \
+    -H "Content-Type: application/ocsp-request" \
+    --data-binary "invalid-data" \
+    --output ./pki/ocsp/bad-response.der
+```
+
+Ожидаемое поведение: сервер должен вернуть HTTP-ошибку или корректный OCSP-ответ со статусом `malformedRequest`.
+
+### Логирование OCSP
+
+При запуске с параметром `--log-file` OCSP-ответчик записывает события в файл:
+
+```shell
+--log-file ./logs/ocsp.log
+```
+
+В логах фиксируются запросы, серийные номера сертификатов, итоговый статус (`good`, `revoked`, `unknown`) и ошибки обработки.
+
 ## Проверка и верификация
 
 ### Проверка цепочки сертификатов
