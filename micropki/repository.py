@@ -8,6 +8,8 @@ import re
 
 import datetime
 from .database import Database
+from .ratelimit import TokenBucketLimiter
+from .audit import log_event
 
 app = FastAPI(title="MicroPKI Repository")
 app.add_middleware(
@@ -23,6 +25,13 @@ http_logger = logging.getLogger("MicroPKI.http")
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     http_logger.info(f"Request: {request.method} {request.url.path} from {request.client.host}")
+    limiter = getattr(app.state, "rate_limiter", None)
+    if limiter:
+        ip = request.client.host if request.client else "unknown"
+        ok, retry = limiter.allow(ip)
+        if not ok:
+            log_event("rate_limit_exceeded", "failure", "Repository rate limit exceeded", {"ip": ip, "path": request.url.path}, out_dir="./pki")
+            return Response("Too Many Requests", status_code=429, headers={"Retry-After": str(retry)})
     response = await call_next(request)
     http_logger.info(f"Response: {response.status_code}")
     return response
@@ -78,9 +87,11 @@ async def get_crl(ca: str = "intermediate"):
         }
     )
 
-def run_server(host: str, port: int, db_path: str, cert_dir: str):
+def run_server(host: str, port: int, db_path: str, cert_dir: str, rate_limit: float = 0, rate_burst: int = 10):
     app.state.db_path = db_path
     app.state.cert_dir = cert_dir
+    app.state.rate_limiter = TokenBucketLimiter(rate_limit, rate_burst) if rate_limit and rate_limit > 0 else None
+    log_event("repo_serve", "started", "Repository server started", {"host": host, "port": port, "rate_limit": rate_limit, "rate_burst": rate_burst}, out_dir="./pki")
     http_logger.info(f"Starting MicroPKI repository server on {host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
@@ -113,6 +124,9 @@ async def api_request_cert(request: Request, template: str):
             media_type="application/x-pem-file",
             status_code=201
         )
-    except Exception as e:
-        http_logger.error(f"API Cert Issuance failed: {e}", exc_info=True)
+    except ValueError as e:
+        http_logger.error("API Cert Issuance rejected: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        http_logger.error("API Cert Issuance failed unexpectedly: %s", e)
+        raise HTTPException(status_code=500, detail="Internal certificate issuance error")

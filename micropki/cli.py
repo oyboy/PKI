@@ -7,6 +7,9 @@ from .logger import setup_logger
 from .ca import init_ca, issue_intermediate, issue_cert, verify_chain, issue_ocsp_cert
 from .database import Database
 from .repository import run_server
+from .audit import read_records, filter_records, print_records, verify_log, log_event
+from .transparency import verify_inclusion
+from .compromise import public_key_hash
 
 from .crypto_utils import load_certificate, load_private_key
 from .revocation import REASON_CODES
@@ -21,12 +24,12 @@ def validate_key_params(args):
         return
     if args.key_type == "rsa":
         args.key_size = args.key_size or 4096
-        if args.key_size != 4096:
-            raise ValueError("--key-size must be 4096 for RSA")
+        if args.key_size < 2048:
+            raise ValueError("--key-size must be at least 2048 for RSA")
     elif args.key_type == "ecc":
         args.key_size = args.key_size or 384
-        if args.key_size != 384:
-            raise ValueError("--key-size must be 384 for ECC")
+        if args.key_size not in (256, 384):
+            raise ValueError("--key-size must be 256 or 384 for ECC")
     else:
         raise ValueError(f"Unsupported key type: {args.key_type}")
 
@@ -45,11 +48,17 @@ def validate_common(args):
 
 def validate_init(args):
     validate_key_params(args)
+    if args.key_type == "rsa" and args.key_size < 4096:
+        raise ValueError("Root CA RSA key must be at least 4096 bits")
+    if args.key_type == "ecc" and args.key_size < 384:
+        raise ValueError("Root CA ECC key must be at least P-384")
     validate_file_readable(args.passphrase_file, "passphrase file")
 
 
 def validate_intermediate(args):
     validate_key_params(args)
+    if args.key_type == "ecc" and args.key_size < 384:
+        raise ValueError("Intermediate CA ECC key must be at least P-384")
     validate_file_readable(args.root_cert, "root cert")
     validate_file_readable(args.root_key, "root key")
     validate_file_readable(args.root_pass_file, "root passphrase file")
@@ -117,7 +126,7 @@ def handle_db_init(args, logger):
 
 
 def handle_repo_serve(args, logger):
-    run_server(args.host, args.port, args.db_path, args.cert_dir)
+    run_server(args.host, args.port, args.db_path, args.cert_dir, args.rate_limit, args.rate_burst)
 
 def handle_revoke(args, logger):
     logger.info(f"Revoking certificate {args.serial}...")
@@ -134,6 +143,7 @@ def handle_revoke(args, logger):
     elif result == "already_revoked":
         logger.warning("Certificate is already revoked.")
     else:
+        log_event("revoke_certificate", "success", "Certificate revoked", {"serial": args.serial.upper(), "reason": args.reason}, out_dir="./pki")
         logger.info(f"SUCCESS: Certificate {args.serial} revoked.")
 
 def handle_gen_crl(args, logger):
@@ -167,12 +177,14 @@ def handle_gen_crl(args, logger):
     with open(out_path, 'wb') as f:
         f.write(crl_pem)
     
+    log_event("generate_crl", "success", "CRL generated", {"ca": args.ca, "path": out_path, "revoked_count": len(revoked)}, out_dir=args.out_dir)
     logger.info(f"SUCCESS: CRL saved to {out_path}")
 
 def handle_issue_ocsp_cert(args, logger):
     issue_ocsp_cert(args, logger)
 
 def handle_ocsp_serve(args, logger):
+    log_event("ocsp_serve", "started", "OCSP responder started", {"host": args.host, "port": args.port}, out_dir="./pki")
     run_ocsp_server(
         args.host, 
         args.port, 
@@ -180,12 +192,74 @@ def handle_ocsp_serve(args, logger):
         args.responder_cert, 
         args.responder_key, 
         args.ca_cert,
-        args.cache_ttl
+        args.cache_ttl,
+        args.rate_limit,
+        args.rate_burst
     )
 
+
+def handle_audit_query(args, logger):
+    records = read_records(args.log_file)
+    records = filter_records(records, args.from_ts, args.to_ts, args.level, args.operation, args.serial)
+    if args.verify:
+        ok, line, msg = verify_log(args.log_file, args.chain_file, subset=records)
+        if not ok:
+            logger.error(f"Audit integrity verification failed at record {line}: {msg}")
+            sys.exit(1)
+    print_records(records, args.format)
+
+def handle_audit_verify(args, logger):
+    ok, line, msg = verify_log(args.log_file, args.chain_file)
+    if ok:
+        print(f"OK: audit log integrity verified. Last hash: {msg}")
+    else:
+        print(f"BROKEN: audit log integrity failed at record {line}: {msg}")
+        sys.exit(1)
+
+def handle_ct_verify(args, logger):
+    cert = load_certificate(args.cert) if args.cert else None
+    ok = verify_inclusion(serial=args.serial, cert=cert, ct_file=args.ct_log)
+    if ok:
+        print("OK: certificate is present in simulated CT log")
+    else:
+        print("MISSING: certificate is not present in simulated CT log")
+        sys.exit(1)
+
+def handle_detect_anomalies(args, logger):
+    records = read_records(args.log_file)
+    counts = {}
+    for r in records:
+        hour = str(r.get("timestamp", ""))[:13]
+        op = r.get("operation")
+        key = (hour, op)
+        counts[key] = counts.get(key, 0) + 1
+    bad = [(h, op, c) for (h, op), c in counts.items() if c >= args.threshold]
+    if not bad:
+        print("OK: anomalies were not detected")
+    else:
+        for h, op, c in bad:
+            print(f"WARNING: {c} events for {op} during {h}:00")
+
+def handle_compromise(args, logger):
+    cert = load_certificate(args.cert)
+    serial = hex(cert.serial_number)[2:].upper()
+    if not args.force:
+        answer = input(f"Compromise and revoke certificate {serial}? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Cancelled")
+            return
+    db = Database(args.db_path, logger)
+    db.init_db()
+    db.revoke_certificate(serial, args.reason)
+    pk_hash = public_key_hash(cert.public_key())
+    db.mark_key_compromised(pk_hash, serial, args.reason)
+    log_event("key_compromise", "success", "Certificate key marked as compromised and revoked", {"serial": serial, "reason": args.reason, "public_key_hash": pk_hash}, out_dir="./pki")
+    print(f"SUCCESS: certificate {serial} revoked with reason {args.reason}; public key marked compromised")
+
 def build_parser():
-    parent = argparse.ArgumentParser(add_help=False)
+    parent = argparse.ArgumentParser(add_help=False, conflict_handler="resolve")
     parent.add_argument("--log-file", default=None)
+    parent.add_argument("--config", default=None, help="Optional MicroPKI config file placeholder")
 
     parser = argparse.ArgumentParser(description="MicroPKI CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -245,10 +319,48 @@ def build_parser():
     list_p.add_argument("--db-path", **db_path_arg)
     list_p.set_defaults(func=handle_list_certs)
 
+    comp_p = ca_subparsers.add_parser("compromise", parents=[parent], help="Simulate private key compromise and revoke certificate")
+    comp_p.add_argument("--cert", required=True)
+    comp_p.add_argument("--reason", default="keyCompromise", choices=list(REASON_CODES.keys()))
+    comp_p.add_argument("--force", action="store_true")
+    comp_p.add_argument("--db-path", **db_path_arg)
+    comp_p.set_defaults(func=handle_compromise)
+
     show_p = ca_subparsers.add_parser("show-cert", parents=[parent])
     show_p.add_argument("serial")
     show_p.add_argument("--db-path", **db_path_arg)
     show_p.set_defaults(func=handle_show_cert)
+
+    audit_parser = subparsers.add_parser("audit", parents=[parent])
+    audit_sub = audit_parser.add_subparsers(dest="action", required=True)
+
+    aq = audit_sub.add_parser("query")
+    aq.add_argument("--from", dest="from_ts")
+    aq.add_argument("--to", dest="to_ts")
+    aq.add_argument("--level", choices=["INFO", "WARNING", "ERROR", "AUDIT"])
+    aq.add_argument("--operation")
+    aq.add_argument("--serial")
+    aq.add_argument("--format", choices=["table", "json", "csv"], default="table")
+    aq.add_argument("--verify", action="store_true")
+    aq.add_argument("--log-file", default="./pki/audit/audit.log")
+    aq.add_argument("--chain-file", default="./pki/audit/chain.dat")
+    aq.set_defaults(func=handle_audit_query)
+
+    av = audit_sub.add_parser("verify")
+    av.add_argument("--log-file", default="./pki/audit/audit.log")
+    av.add_argument("--chain-file", default="./pki/audit/chain.dat")
+    av.set_defaults(func=handle_audit_verify)
+
+    ctv = audit_sub.add_parser("ct-verify")
+    ctv.add_argument("--serial")
+    ctv.add_argument("--cert")
+    ctv.add_argument("--ct-log", default="./pki/audit/ct.log")
+    ctv.set_defaults(func=handle_ct_verify)
+
+    det = audit_sub.add_parser("detect-anomalies")
+    det.add_argument("--log-file", default="./pki/audit/audit.log")
+    det.add_argument("--threshold", type=int, default=10)
+    det.set_defaults(func=handle_detect_anomalies)
 
     db_parser = subparsers.add_parser("db", parents=[parent])
     db_subparsers = db_parser.add_subparsers(dest="action", required=True)
@@ -265,6 +377,8 @@ def build_parser():
     serve_p.add_argument("--port", type=int, default=8080)
     serve_p.add_argument("--db-path", **db_path_arg)
     serve_p.add_argument("--cert-dir", **cert_dir_arg)
+    serve_p.add_argument("--rate-limit", type=float, default=0)
+    serve_p.add_argument("--rate-burst", type=int, default=10)
     serve_p.set_defaults(func=handle_repo_serve)
 
     revoke_p = ca_subparsers.add_parser("revoke", help="Revoke a certificate")
@@ -308,6 +422,8 @@ def build_parser():
     ocsp_serve_p.add_argument("--responder-key", required=True)
     ocsp_serve_p.add_argument("--ca-cert", required=True)
     ocsp_serve_p.add_argument("--cache-ttl", type=int, default=60, help="Cache TTL in seconds")
+    ocsp_serve_p.add_argument("--rate-limit", type=float, default=0)
+    ocsp_serve_p.add_argument("--rate-burst", type=int, default=10)
     ocsp_serve_p.add_argument("--log-file", default=None, help="Path to log file")
 
     ocsp_serve_p.set_defaults(func=handle_ocsp_serve)

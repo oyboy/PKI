@@ -13,6 +13,10 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 from .database import Database
+from .audit import log_event
+from .policy import validate_ca_key, validate_validity, validate_intermediate_policy, validate_leaf_policy
+from .transparency import append_ct
+from .compromise import public_key_hash
 
 def create_policy_file(out_dir, args, cert):
     policy_path = os.path.join(out_dir, "policy.txt")
@@ -40,6 +44,13 @@ def create_policy_file(out_dir, args, cert):
 
 def init_ca(args, logger):
     logger.info("=== Starting Root CA initialization ===")
+    log_event("ca_init", "started", "Root CA initialization started", {"subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+    try:
+        validate_validity("root", args.validity_days)
+    except ValueError as e:
+        log_event("policy_violation", "failure", str(e), {"operation": "ca_init", "subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+        logger.error(str(e))
+        sys.exit(1)
 
     try:
         with open(args.passphrase_file, "rb") as f:
@@ -63,6 +74,12 @@ def init_ca(args, logger):
 
     logger.info(f"Generating {args.key_type.upper()} key ({args.key_size} bits)")
     private_key = generate_key(args.key_type, args.key_size)
+    try:
+        validate_ca_key(private_key.public_key(), "root")
+    except ValueError as e:
+        log_event("policy_violation", "failure", str(e), {"operation": "ca_init", "subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+        logger.error(str(e))
+        sys.exit(1)
 
     logger.info("Creating self-signed X.509v3 certificate")
     try:
@@ -84,6 +101,12 @@ def init_ca(args, logger):
     logger.info("Generating policy.txt")
     policy_path = create_policy_file(args.out_dir, args, cert)
 
+    db_path = getattr(args, "db_path", None)
+    if db_path:
+        db = Database(db_path, logger)
+        db.init_db()
+        db.insert_cert(cert)
+    log_event("ca_init", "success", "Root CA initialized", {"subject": args.subject, "serial": hex(cert.serial_number)[2:].upper()}, out_dir=getattr(args, "out_dir", "./pki"))
     logger.info(f"SUCCESS: Root CA successfully created in {args.out_dir}")
     logger.info(f"   Private key: {key_path}")
     logger.info(f"   Certificate: {cert_path}")
@@ -91,6 +114,15 @@ def init_ca(args, logger):
 
 def issue_intermediate(args, logger):
     logger.info("=== Starting Intermediate CA issuance ===")
+    log_event("issue_intermediate", "started", "Intermediate CA issuance started", {"subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+    try:
+        validate_validity("intermediate", args.validity_days)
+        if getattr(args, "pathlen", 0) != 0:
+            raise ValueError("Policy violation: intermediate pathLen must be 0")
+    except ValueError as e:
+        log_event("policy_violation", "failure", str(e), {"operation": "issue_intermediate", "subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+        logger.error(str(e))
+        sys.exit(1)
     
     logger.info(f"Loading Root CA from {args.root_cert} and {args.root_key}")
     with open(args.root_pass_file, "rb") as f:
@@ -100,6 +132,12 @@ def issue_intermediate(args, logger):
 
     logger.info(f"Generating new {args.key_type.upper()} key ({args.key_size} bits) for Intermediate CA")
     intermediate_key = generate_key(args.key_type, args.key_size)
+    try:
+        validate_intermediate_policy(intermediate_key.public_key(), args.validity_days, args.pathlen)
+    except ValueError as e:
+        log_event("policy_violation", "failure", str(e), {"operation": "issue_intermediate", "subject": args.subject}, out_dir=getattr(args, "out_dir", "./pki"))
+        logger.error(str(e))
+        sys.exit(1)
 
     subject = parse_dn(args.subject)
     issuer = root_cert.subject
@@ -149,6 +187,8 @@ def issue_intermediate(args, logger):
         logger.error(f"FATAL: Could not write cert to database. Aborting. Error: {e}")
         sys.exit(1)
 
+    append_ct(intermediate_cert, out_dir=getattr(args, "out_dir", "./pki"))
+    log_event("issue_intermediate", "success", "Intermediate CA issued", {"subject": args.subject, "serial": hex(intermediate_cert.serial_number)[2:].upper(), "pathlen": args.pathlen}, out_dir=getattr(args, "out_dir", "./pki"))
     logger.info("SUCCESS: Intermediate CA created and recorded in the database.")
     logger.info(f"  Key: {key_path}")
     logger.info(f"  Cert: {cert_path}")
@@ -156,6 +196,14 @@ def issue_intermediate(args, logger):
 
 def issue_cert(args, logger, csr_obj=None):
     logger.info(f"=== Starting certificate issuance with template '{args.template}' ===")
+    log_event("issue_certificate", "started", "Certificate issuance started", {"template": args.template, "subject": getattr(args, "subject", None)}, out_dir=getattr(args, "out_dir", "./pki/certs"))
+
+    def fail(msg):
+        log_event("policy_violation", "failure", msg, {"operation": "issue_certificate", "template": args.template, "subject": getattr(args, "subject", None)}, out_dir=getattr(args, "out_dir", "./pki/certs"))
+        logger.error(msg)
+        if csr_obj is None:
+            sys.exit(1)
+        raise ValueError(msg)
 
     with open(args.ca_pass_file, "rb") as f:
         ca_pass = f.read().strip()
@@ -165,19 +213,16 @@ def issue_cert(args, logger, csr_obj=None):
 
     entity_private_key = None
     san_names = []
-    
+
     if csr_obj:
         if not csr_obj.is_signature_valid:
-            logger.error("CSR signature is invalid!")
-            raise ValueError("CSR signature is invalid")
-            
+            fail("CSR signature is invalid")
         logger.info("Using data from provided CSR")
         subject = csr_obj.subject
         public_key = csr_obj.public_key()
-        
         try:
             san_ext = csr_obj.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            san_names = san_ext.value
+            san_names = list(san_ext.value)
         except x509.ExtensionNotFound:
             pass
     else:
@@ -185,14 +230,21 @@ def issue_cert(args, logger, csr_obj=None):
         entity_private_key = generate_key("rsa", 2048)
         public_key = entity_private_key.public_key()
         subject = parse_dn(args.subject)
-        
         san_list = args.san or []
         if san_list:
             san_names = parse_san(san_list)
 
-    if args.template == "server" and not san_names:
-        logger.error("Server certificate requires SAN")
-        raise ValueError("Server certificate requires SAN")
+    try:
+        validate_leaf_policy(args.template, public_key, san_names, args.validity_days, csr=csr_obj)
+    except ValueError as e:
+        fail(str(e))
+
+    db = Database(args.db_path, logger)
+    db.init_db()
+    pk_hash = public_key_hash(public_key)
+    compromised = db.is_public_key_compromised(pk_hash)
+    if compromised:
+        fail(f"Policy violation: public key is compromised (original serial {compromised[0]})")
 
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(subject)
@@ -205,16 +257,10 @@ def issue_cert(args, logger, csr_obj=None):
     builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
     builder = builder.add_extension(x509.KeyUsage(**template["key_usage"]), critical=True)
     builder = builder.add_extension(x509.ExtendedKeyUsage(template["extended_key_usage"]), critical=False)
-    
     if san_names:
         builder = builder.add_extension(x509.SubjectAlternativeName(san_names), critical=False)
-    
-    builder = builder.add_extension(
-        x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()), critical=False
-    )
-    builder = builder.add_extension(
-        x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
-    )
+    builder = builder.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()), critical=False)
+    builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
 
     hash_alg = hashes.SHA256() if isinstance(ca_key, rsa.RSAPrivateKey) else hashes.SHA384()
     entity_cert = builder.sign(ca_key, hash_alg)
@@ -223,20 +269,23 @@ def issue_cert(args, logger, csr_obj=None):
         cn = subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
     except IndexError:
         cn = "cert_" + hex(entity_cert.serial_number)[2:10]
-    
+
+    os.makedirs(args.out_dir, exist_ok=True)
     base_name = cn.replace(" ", "_").replace("*", "wildcard").lower()
     cert_path = os.path.join(args.out_dir, f"{base_name}.cert.pem")
     key_path = os.path.join(args.out_dir, f"{base_name}.key.pem")
 
     save_cert(entity_cert, cert_path)
-    db = Database(args.db_path, logger)
     db.insert_cert(entity_cert)
+    append_ct(entity_cert, out_dir=getattr(args, "out_dir", "./pki/certs"))
 
     if entity_private_key:
         logger.warning(f"Saving newly generated unencrypted private key to {key_path}")
         save_unencrypted_key(entity_private_key, key_path)
         os.chmod(key_path, 0o600)
 
+    serial = hex(entity_cert.serial_number)[2:].upper()
+    log_event("issue_certificate", "success", f"Issued {args.template} certificate", {"serial": serial, "subject": subject.rfc4514_string(), "template": args.template}, out_dir=getattr(args, "out_dir", "./pki/certs"))
     logger.info(f"SUCCESS: Certificate for '{cn}' issued.")
     return entity_cert
 
@@ -317,6 +366,9 @@ def issue_ocsp_cert(args, logger):
     os.chmod(key_path, 0o600)
     
     db = Database(args.db_path, logger)
+    db.init_db()
     db.insert_cert(cert)
+    append_ct(cert, out_dir=getattr(args, "out_dir", "./pki/certs"))
+    log_event("issue_ocsp_cert", "success", "OCSP responder certificate issued", {"serial": hex(cert.serial_number)[2:].upper(), "subject": cert.subject.rfc4514_string()}, out_dir=getattr(args, "out_dir", "./pki/certs"))
     
     logger.info(f"SUCCESS: OCSP Responder cert: {cert_path}")

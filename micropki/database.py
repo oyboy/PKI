@@ -43,7 +43,18 @@ class Database:
                     last_generated TEXT NOT NULL
                 );
                 """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS compromised_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    public_key_hash TEXT UNIQUE NOT NULL,
+                    certificate_serial TEXT NOT NULL,
+                    compromise_date TEXT NOT NULL,
+                    compromise_reason TEXT NOT NULL,
+                    FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+                );
+                """)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON certificates (status);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_compromised_hash ON compromised_keys (public_key_hash);")
                 conn.commit()
             self.logger.info("Database schema initialized successfully.")
         except Exception as e:
@@ -162,3 +173,22 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM certificates WHERE serial_hex = ?", (serial_hex.upper(),))
             return cursor.fetchone()
+    def mark_key_compromised(self, public_key_hash, serial_hex, reason):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO compromised_keys (public_key_hash, certificate_serial, compromise_date, compromise_reason)
+                VALUES (?, ?, ?, ?)
+            """, (public_key_hash, serial_hex.upper(), now, reason))
+            conn.commit()
+
+    def is_public_key_compromised(self, public_key_hash):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT certificate_serial, compromise_reason FROM compromised_keys WHERE public_key_hash = ?", (public_key_hash,))
+            return cursor.fetchone()
+
+    def get_cert_record_by_path(self, cert):
+        serial = hex(cert.serial_number)[2:].upper()
+        return self.get_cert_record_by_serial(serial)

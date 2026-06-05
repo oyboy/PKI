@@ -63,7 +63,7 @@ prepare_workspace
 
 info "============================== SPRINT 1 =============================="
 info "--- Инициализация БД ---"
-python -m micropki db init
+python3 -m micropki db init
 [ -f ./pki/micropki.db ] || fail "Файл базы данных не создан."
 ok "База данных успешно инициализирована."
 
@@ -169,6 +169,7 @@ python3 -m micropki ca issue-cert \
     --ca-key ./pki/private/intermediate.key.pem \
     --ca-pass-file ./secrets/intermediate.pass \
     --template code_signing \
+    --san dns:codesigner.corp \
     --subject "/CN=MicroPKI Code Signer" \
     --out-dir ./pki/certs \
     --log-file ./logs/test.log
@@ -228,23 +229,58 @@ fi
 kill $SERVER_PID
 SERVER_PID=""
 
-: <<'COMMENT'
 info "============================== SPRINT 3 =============================="
 info "--- Выпуск 5 конечных сертификатов ---"
+
 CERT_SUBJECTS=("server1.example.com" "server2.example.com" "client.user" "another.client" "codesigner.corp")
 CERT_TEMPLATES=("server" "server" "client" "client" "code_signing")
 
 for i in {0..4}; do
-    subj="/CN=${CERT_SUBJECTS[$i]}"
-    template=${CERT_TEMPLATES[$i]}
+    cn="${CERT_SUBJECTS[$i]}"
+    subj="/CN=${cn}"
+    template="${CERT_TEMPLATES[$i]}"
+
     info "Выпуск сертификата для ${subj} (шаблон: ${template})"
-    python -m micropki ca issue-cert --ca-cert ./pki/certs/intermediate.cert.pem --ca-key ./pki/private/intermediate.key.pem --ca-pass-file ./secrets/intermediate.pass --template ${template} --subject "${subj}" --san "dns:${CERT_SUBJECTS[$i]}" --out-dir ./pki/certs
+
+    if [ "$template" = "server" ]; then
+        python3 -m micropki ca issue-cert \
+            --ca-cert ./pki/certs/intermediate.cert.pem \
+            --ca-key ./pki/private/intermediate.key.pem \
+            --ca-pass-file ./secrets/intermediate.pass \
+            --template "$template" \
+            --subject "$subj" \
+            --san "dns:${cn}" \
+            --out-dir ./pki/certs
+
+    elif [ "$template" = "client" ]; then
+        python3 -m micropki ca issue-cert \
+            --ca-cert ./pki/certs/intermediate.cert.pem \
+            --ca-key ./pki/private/intermediate.key.pem \
+            --ca-pass-file ./secrets/intermediate.pass \
+            --template "$template" \
+            --subject "$subj" \
+            --san "email:${cn}@example.com" \
+            --san "dns:${cn}" \
+            --out-dir ./pki/certs
+
+    elif [ "$template" = "code_signing" ]; then
+        python3 -m micropki ca issue-cert \
+            --ca-cert ./pki/certs/intermediate.cert.pem \
+            --ca-key ./pki/private/intermediate.key.pem \
+            --ca-pass-file ./secrets/intermediate.pass \
+            --template "$template" \
+            --subject "$subj" \
+            --san "dns:${cn}" \
+            --san "uri:https://${cn}/signing" \
+            --out-dir ./pki/certs
+    fi
 done
+
 ok "5 сертификатов выпущено."
 
 info "--- Проверка сертификатов через CLI ---"
-CERT_COUNT=$(python -m micropki ca list-certs --format csv | wc -l)
-[ "$CERT_COUNT" -eq 10 ] || fail "В БД неверное количество сертификатов. Ожидалось 7, найдено $((CERT_COUNT - 1))."
+CERT_COUNT=$(python3 -m micropki ca list-certs --format csv | tail -n +2 | wc -l)
+[ "$CERT_COUNT" -eq 10 ] || fail "В БД неверное количество сертификатов. Ожидалось 10, найдено $CERT_COUNT."
 SERIAL_TO_CHECK=$(python -m micropki ca list-certs --format csv | grep server1 | cut -d, -f1)
 python -m micropki ca show-cert ${SERIAL_TO_CHECK} | grep -q "BEGIN CERTIFICATE" || fail "ca show-cert не вернул PEM сертификат."
 ok "Проверки list-certs и show-cert прошли успешно."
@@ -343,7 +379,8 @@ kill $SERVER_PID
 SERVER_PID=""
 rm downloaded.crl.pem to-be-revoked.com.cert.pem to-be-revoked.com.key.pem
 ok "API успешно отдает файлы CRL."
-COMMENT
+
+
 info "============================== SPRINT 5 =============================="
 
 info "--- [TEST-28] Выпуск и проверка сертификата OCSP-ответчика ---"
@@ -570,6 +607,342 @@ kill -9 $OCSP_PID 2>/dev/null || true
 REPO_PID=""
 OCSP_PID=""
 
+info "============================== SPRINT 7 =============================="
+
+AUDIT_LOG="./pki/audit/audit.log"
+AUDIT_CHAIN="./pki/audit/chain.dat"
+CT_LOG="./pki/audit/ct.log"
+
+cleanup_s7_servers() {
+    kill -9 $S7_REPO_PID 2>/dev/null || true
+    S7_REPO_PID=""
+}
+trap cleanup_s7_servers EXIT
+
+info "--- [TEST-51] Нарушение политики: RSA 1024 в CSR должен быть отклонён ---"
+rm -f ./s7-weak.key.pem ./s7-weak.csr.pem ./s7-weak.cert.pem
+
+python3 -m micropki client gen-csr \
+    --subject "/CN=s7-weak.example.com" \
+    --key-type rsa \
+    --key-size 1024 \
+    --san dns:s7-weak.example.com \
+    --out-key ./s7-weak.key.pem \
+    --out-csr ./s7-weak.csr.pem
+
+python3 -m micropki repo serve --port 18080 &
+S7_REPO_PID=$!
+sleep 2
+
+set +e
+WEAK_OUT=$(python3 -m micropki client request-cert \
+    --csr ./s7-weak.csr.pem \
+    --template server \
+    --ca-url http://localhost:18080 \
+    --out-cert ./s7-weak.cert.pem 2>&1)
+WEAK_RET=$?
+set -e
+
+kill $S7_REPO_PID
+S7_REPO_PID=""
+
+[ $WEAK_RET -ne 0 ] || fail "CA выпустил сертификат с RSA 1024, хотя должен был отклонить."
+echo "$WEAK_OUT" | grep -Eqi "2048|Policy violation|Error 400" || fail "Ошибка по RSA 1024 не содержит признаков нарушения политики."
+grep -q "policy_violation" "$AUDIT_LOG" || fail "Нарушение политики RSA 1024 не записано в аудит."
+ok "RSA 1024 корректно заблокирован и записан в аудит."
+
+
+info "--- [TEST-52] Нарушение политики: срок действия leaf > 365 дней ---"
+set +e
+VALIDITY_OUT=$(python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "/CN=s7-too-long.example.com" \
+    --san dns:s7-too-long.example.com \
+    --out-dir ./pki/certs \
+    --validity-days 366 2>&1)
+VALIDITY_RET=$?
+set -e
+
+[ $VALIDITY_RET -ne 0 ] || fail "CA выпустил leaf-сертификат со сроком > 365 дней."
+echo "$VALIDITY_OUT" | grep -Eqi "365|validity|Policy violation" || fail "Ошибка по сроку действия не содержит понятного сообщения."
+grep -q "policy_violation" "$AUDIT_LOG" || fail "Нарушение срока действия не записано в аудит."
+ok "Превышение срока действия leaf-сертификата корректно заблокировано."
+
+
+info "--- [TEST-53] Нарушение политики: wildcard SAN запрещён по умолчанию ---"
+set +e
+WILDCARD_OUT=$(python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "/CN=*.s7-wild.example.com" \
+    --san dns:*.s7-wild.example.com \
+    --out-dir ./pki/certs \
+    --validity-days 365 2>&1)
+WILDCARD_RET=$?
+set -e
+
+[ $WILDCARD_RET -ne 0 ] || fail "CA выпустил wildcard-сертификат, хотя wildcard должен быть запрещён."
+echo "$WILDCARD_OUT" | grep -Eqi "wildcard|Policy violation" || fail "Ошибка по wildcard SAN не содержит понятного сообщения."
+grep -q "policy_violation" "$AUDIT_LOG" || fail "Нарушение wildcard SAN не записано в аудит."
+ok "Wildcard SAN корректно заблокирован."
+
+
+info "--- [TEST-54] Нарушение политики: запрещённый тип SAN для code_signing ---"
+set +e
+SAN_OUT=$(python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template code_signing \
+    --subject "/CN=s7-code.example.com" \
+    --san email:dev@s7-code.example.com \
+    --out-dir ./pki/certs \
+    --validity-days 365 2>&1)
+SAN_RET=$?
+set -e
+
+[ $SAN_RET -ne 0 ] || fail "CA выпустил code_signing-сертификат с запрещённым email SAN."
+echo "$SAN_OUT" | grep -Eqi "SAN|email|not allowed|Policy violation" || fail "Ошибка по запрещённому SAN не содержит понятного сообщения."
+grep -q "policy_violation" "$AUDIT_LOG" || fail "Нарушение SAN-политики не записано в аудит."
+ok "Запрещённый SAN для code_signing корректно заблокирован."
+
+
+info "--- [TEST-59] CT log: валидный сертификат должен попасть в ct.log ---"
+python3 -m micropki ca issue-cert \
+    --ca-cert ./pki/certs/intermediate.cert.pem \
+    --ca-key ./pki/private/intermediate.key.pem \
+    --ca-pass-file ./secrets/intermediate.pass \
+    --template server \
+    --subject "/CN=s7-valid.example.com" \
+    --san dns:s7-valid.example.com \
+    --out-dir ./pki/certs \
+    --validity-days 365
+
+S7_VALID_CERT="./pki/certs/s7-valid.example.com.cert.pem"
+[ -f "$S7_VALID_CERT" ] || fail "Валидный сертификат s7-valid не был создан."
+
+S7_VALID_SERIAL=$(openssl x509 -in "$S7_VALID_CERT" -noout -serial | cut -d= -f2 | tr 'a-f' 'A-F')
+[ -n "$S7_VALID_SERIAL" ] || fail "Не удалось получить serial валидного сертификата."
+
+[ -f "$CT_LOG" ] || fail "CT-журнал $CT_LOG не создан."
+grep -qi "$S7_VALID_SERIAL" "$CT_LOG" || fail "Serial валидного сертификата отсутствует в ct.log."
+
+python3 -m micropki audit ct-verify \
+    --cert "$S7_VALID_CERT" \
+    --ct-log "$CT_LOG"
+
+ok "CT-журнал содержит выпущенный сертификат."
+
+
+info "--- [CLI-31] audit query: фильтрация записей аудита ---"
+python3 -m micropki audit query \
+    --level AUDIT \
+    --operation policy_violation \
+    --format json > ./s7-audit-query.json
+
+grep -q "policy_violation" ./s7-audit-query.json || fail "audit query не нашёл записи policy_violation."
+ok "audit query работает с фильтрами и JSON-выводом."
+
+
+info "--- [CLI-32/AUD-3] audit verify: полная проверка целостности журнала ---"
+python3 -m micropki audit verify \
+    --log-file "$AUDIT_LOG" \
+    --chain-file "$AUDIT_CHAIN" | grep -q "OK" || fail "audit verify не подтвердил целостность журнала."
+
+ok "Целостность audit log подтверждена."
+
+
+info "--- [TEST-55] Audit integrity: обнаружение подделки записи ---"
+cp "$AUDIT_LOG" ./s7-audit-tampered.log
+cp "$AUDIT_CHAIN" ./s7-chain-tampered.dat
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("./s7-audit-tampered.log")
+data = p.read_text(encoding="utf-8")
+
+# Меняем один байт, сохраняя валидный JSON, чтобы проверка упала именно по hash-chain.
+if "success" in data:
+    data = data.replace("success", "succezz", 1)
+elif "failure" in data:
+    data = data.replace("failure", "failurz", 1)
+else:
+    raise SystemExit("No mutable audit status found")
+
+p.write_text(data, encoding="utf-8")
+PY
+
+set +e
+python3 -m micropki audit verify \
+    --log-file ./s7-audit-tampered.log \
+    --chain-file ./s7-chain-tampered.dat > ./s7-audit-tampered.out 2>&1
+TAMPER_RET=$?
+set -e
+
+[ $TAMPER_RET -ne 0 ] || fail "audit verify не обнаружил подделку audit.log."
+grep -Eqi "BROKEN|failed|mismatch" ./s7-audit-tampered.out || fail "audit verify завершился с ошибкой, но не сообщил о нарушении целостности."
+ok "Подделка audit.log обнаружена."
+
+
+info "--- [TEST-56] Audit integrity: обнаружение пропущенной записи ---"
+cp "$AUDIT_CHAIN" ./s7-chain-missing.dat
+awk 'NR != 2' "$AUDIT_LOG" > ./s7-audit-missing.log
+
+set +e
+python3 -m micropki audit verify \
+    --log-file ./s7-audit-missing.log \
+    --chain-file ./s7-chain-missing.dat > ./s7-audit-missing.out 2>&1
+MISSING_RET=$?
+set -e
+
+[ $MISSING_RET -ne 0 ] || fail "audit verify не обнаружил удалённую запись из audit.log."
+grep -Eqi "BROKEN|failed|mismatch" ./s7-audit-missing.out || fail "audit verify не сообщил о разрыве hash-chain."
+ok "Удаление записи из audit.log обнаружено."
+
+
+info "--- [TEST-57] Компрометация ключа и блокировка повторного выпуска ---"
+rm -f ./s7-comp.key.pem ./s7-comp.csr.pem ./s7-comp.cert.pem ./s7-reuse.csr.pem ./s7-reuse.cert.pem
+
+python3 -m micropki client gen-csr \
+    --subject "/CN=s7-comp.example.com" \
+    --key-type rsa \
+    --key-size 2048 \
+    --san dns:s7-comp.example.com \
+    --out-key ./s7-comp.key.pem \
+    --out-csr ./s7-comp.csr.pem
+
+python3 -m micropki repo serve --port 18081 &
+S7_REPO_PID=$!
+sleep 2
+
+python3 -m micropki client request-cert \
+    --csr ./s7-comp.csr.pem \
+    --template server \
+    --ca-url http://localhost:18081 \
+    --out-cert ./s7-comp.cert.pem
+
+kill $S7_REPO_PID
+S7_REPO_PID=""
+
+[ -f ./s7-comp.cert.pem ] || fail "Не удалось выпустить сертификат для теста компрометации."
+
+S7_COMP_SERIAL=$(openssl x509 -in ./s7-comp.cert.pem -noout -serial | cut -d= -f2 | tr 'a-f' 'A-F')
+
+python3 -m micropki ca compromise \
+    --cert ./s7-comp.cert.pem \
+    --reason keyCompromise \
+    --force
+
+python3 - "$S7_COMP_SERIAL" <<'PY'
+import sqlite3
+import sys
+
+serial = sys.argv[1].upper()
+conn = sqlite3.connect("./pki/micropki.db")
+cur = conn.cursor()
+
+cur.execute(
+    "SELECT status, revocation_reason FROM certificates WHERE serial_hex = ?",
+    (serial,)
+)
+cert_row = cur.fetchone()
+
+if not cert_row:
+    raise SystemExit("certificate row not found")
+
+if cert_row[0] != "revoked" or cert_row[1] != "keyCompromise":
+    raise SystemExit(f"bad certificate state: {cert_row}")
+
+cur.execute(
+    "SELECT COUNT(*) FROM compromised_keys WHERE certificate_serial = ?",
+    (serial,)
+)
+count = cur.fetchone()[0]
+
+if count < 1:
+    raise SystemExit("compromised_keys row not found")
+PY
+
+openssl req -new \
+    -key ./s7-comp.key.pem \
+    -out ./s7-reuse.csr.pem \
+    -subj "/CN=s7-reuse.example.com" \
+    -addext "subjectAltName=DNS:s7-reuse.example.com"
+
+python3 -m micropki repo serve --port 18083 &
+S7_REPO_PID=$!
+sleep 2
+
+set +e
+REUSE_OUT=$(python3 -m micropki client request-cert \
+    --csr ./s7-reuse.csr.pem \
+    --template server \
+    --ca-url http://localhost:18083 \
+    --out-cert ./s7-reuse.cert.pem 2>&1)
+REUSE_RET=$?
+set -e
+
+kill $S7_REPO_PID
+S7_REPO_PID=""
+
+[ $REUSE_RET -ne 0 ] || fail "CA выпустил сертификат на уже скомпрометированном ключе."
+echo "$REUSE_OUT" | grep -Eqi "compromised|скомпромет|Policy violation|Error 400" || fail "Ошибка повторного выпуска не указывает на компрометацию ключа."
+grep -q "key_compromise" "$AUDIT_LOG" || fail "Событие компрометации ключа не записано в аудит."
+
+ok "Компрометация ключа фиксируется, сертификат отзывается, повторный выпуск блокируется."
+
+
+info "--- [TEST-58] Rate limit: repo serve должен отдавать 429 Too Many Requests ---"
+python3 -m micropki repo serve \
+    --port 18082 \
+    --rate-limit 1 \
+    --rate-burst 2 &
+S7_REPO_PID=$!
+sleep 2
+
+RATE_CODES=""
+for i in 1 2 3 4 5; do
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18082/ca/root)
+    RATE_CODES="$RATE_CODES $CODE"
+done
+
+kill $S7_REPO_PID
+S7_REPO_PID=""
+
+RATE_429_COUNT=$(echo "$RATE_CODES" | grep -o "429" | wc -l | tr -d ' ')
+
+[ "$RATE_429_COUNT" -ge 2 ] || fail "Rate limit не сработал. Коды ответов:$RATE_CODES"
+grep -q "rate_limit_exceeded" "$AUDIT_LOG" || fail "Превышение rate limit не записано в аудит."
+
+ok "Rate limit работает: получены 429 и запись в аудите."
+
+
+info "--- [CTL-5] detect-anomalies: эвристический анализ аудита ---"
+python3 -m micropki audit detect-anomalies \
+    --log-file "$AUDIT_LOG" \
+    --threshold 2 > ./s7-anomalies.out
+
+grep -Eqi "OK|WARNING" ./s7-anomalies.out || fail "detect-anomalies не вернул ожидаемый результат."
+ok "detect-anomalies выполняется."
+
+
+info "--- [TEST-60] Итоговая проверка Sprint 7 ---"
+python3 -m micropki audit verify \
+    --log-file "$AUDIT_LOG" \
+    --chain-file "$AUDIT_CHAIN" | grep -q "OK" || fail "Финальная проверка audit hash-chain не прошла."
+
+[ -f "$CT_LOG" ] || fail "CT log отсутствует после полного набора тестов."
+grep -q "policy_violation" "$AUDIT_LOG" || fail "В audit log нет записей о нарушениях политик."
+grep -q "issue_certificate" "$AUDIT_LOG" || fail "В audit log нет записей о выпуске сертификатов."
+grep -q "key_compromise" "$AUDIT_LOG" || fail "В audit log нет записей о компрометации ключа."
+
+ok "Sprint 7: политики, аудит, CT, компрометация и rate-limit проверены."
 
 echo ""
 echo -e "${GREEN}========================================="
