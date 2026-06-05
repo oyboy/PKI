@@ -575,6 +575,116 @@ python3 -m micropki client check-status \
 - `--ocsp-url` — ручное указание адреса **OCSP**-ответчика
 - `--crl` — ручное указание адреса или пути к **CRL**
 
+## Аудит, политики безопасности и эксплуатационная защита
+
+### Аудит с криптографической целостностью
+
+Проверка целостности всего журнала:
+
+```bash
+python3 -m micropki audit verify \
+  --log-file ./pki/audit/audit.log \
+  --chain-file ./pki/audit/chain.dat
+```
+
+Запрос записей аудита:
+
+```bash
+python3 -m micropki audit query \
+  --from 2026-06-04T00:00:00Z \
+  --operation issue \
+  --format table
+```
+
+Поддерживаемые фильтры: `--from`, `--to`, `--level`, `--operation`, `--serial`. Форматы вывода: `table`, `json`, `csv`. Флаг `--verify` включает проверку цепочки для выбранных записей и завершает команду с ненулевым кодом при нарушении целостности.
+
+Критичные операции пишутся в аудит до старта и после завершения: инициализация CA, выпуск сертификатов, выпуск intermediate CA, отзыв, генерация CRL, запуск HTTP-сервисов, превышение rate-limit, нарушения политик и симуляция компрометации ключа. Закрытые ключи, passphrase и секретные данные в аудит не записываются.
+
+### Политики выпуска сертификатов
+
+Команды `ca init`, `ca issue-intermediate` и `ca issue-cert` теперь принудительно проверяют политики безопасности:
+
+- Root CA: RSA минимум 4096 бит, ECC минимум P-384, срок не более 3650 дней.
+- Intermediate CA: RSA минимум 2048 бит, ECC минимум P-384, срок не более 1825 дней, `pathLen` обязан быть `0`.
+- End-entity сертификаты: RSA минимум 2048 бит, ECC минимум P-256, срок не более 365 дней.
+- Server SAN: разрешены только `dns` и `ip`; wildcard `dns:*.example.com` запрещён по умолчанию.
+- Client SAN: требуется как минимум один `email`; также допустимы `dns`, `ip`, `uri`.
+- Code signing SAN: разрешены только `dns` и `uri`; `email` и `ip` запрещены.
+- CSR с недопустимым или слабым алгоритмом подписи отклоняется.
+- Если публичный ключ уже помечен как compromised, повторный выпуск по CSR с тем же ключом блокируется.
+
+Любое нарушение политики прерывает выпуск и создаёт AUDIT-запись `policy_violation`.
+
+### Ограничение скорости запросов
+
+`repo serve` и `ocsp serve` поддерживают token bucket rate-limit на IP-клиента:
+
+```bash
+python3 -m micropki repo serve \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --rate-limit 5 \
+  --rate-burst 10
+```
+
+```bash
+python3 -m micropki ocsp serve \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --responder-cert ./pki/certs/ocsp.cert.pem \
+  --responder-key ./pki/certs/ocsp.key.pem \
+  --ca-cert ./pki/certs/intermediate.cert.pem \
+  --rate-limit 5 \
+  --rate-burst 10
+```
+
+`--rate-limit 0` отключает ограничение. При превышении лимита сервер возвращает `429 Too Many Requests` и заголовок `Retry-After`. Событие фиксируется в аудите как `rate_limit_exceeded`.
+
+### Симуляция Certificate Transparency
+
+Для каждого выпущенного сертификата добавляется строка в публичный текстовый CT-журнал `./pki/audit/ct.log`. Формат строки:
+
+```text
+timestamp | serial_hex | subject_dn | cert_sha256_fingerprint | issuer_dn
+```
+
+Файл создаётся с правами `0644`, так как не содержит секретов.
+
+Проверка включения сертификата в CT-журнал:
+
+```bash
+python3 -m micropki audit ct-verify --serial 2A7F8B3C --ct-log ./pki/audit/ct.log
+```
+
+или по файлу сертификата:
+
+```bash
+python3 -m micropki audit ct-verify --cert ./pki/certs/example.com.cert.pem
+```
+
+### Симуляция компрометации ключа
+
+Команда `ca compromise` помечает сертификат как скомпрометированный, отзывает его с причиной `keyCompromise` и записывает SHA-256 хеш публичного ключа в таблицу `compromised_keys`.
+
+```bash
+python3 -m micropki ca compromise \
+  --cert ./pki/certs/example.com.cert.pem \
+  --reason keyCompromise \
+  --force
+```
+
+После этого любой CSR с тем же публичным ключом будет отклонён при выпуске нового сертификата.
+
+### Быстрая проверка защиты
+
+```bash
+python3 -m micropki audit verify
+python3 -m micropki audit query --operation policy_violation --format table
+python3 -m micropki audit ct-verify --serial <SERIAL>
+python3 -m micropki audit detect-anomalies --threshold 10
+```
+
+
 ## Проверка и верификация
 
 ### Проверка цепочки сертификатов
